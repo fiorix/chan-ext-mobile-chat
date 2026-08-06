@@ -4,6 +4,20 @@ This file records notable development history and design decisions. Reference do
 
 ## 2026-08-06
 
+### v0.1.0
+
+First release. Tagging `vX.Y.Z` builds and tests on four native runners (Linux x86_64 and aarch64 against musl, macOS aarch64, Windows x86_64), packages a reproducible archive per platform, and publishes them with `SHA256SUMS` and `install.sh`. CI refuses a tag that does not match the workspace version.
+
+### What the Windows runner caught
+
+A `cargo xwin check` cross-compile passes on code that is wrong at runtime, and it did. Two bugs only showed up once the tests actually ran on Windows:
+
+`socket_tail` treated the `.sock` suffix as optional there, so every `chan-control-*` name matched whatever its extension. `\\.\pipe\` lists every named pipe on the machine, so that would have probed unrelated processes' pipes. A name now qualifies only with `.sock`, or with no extension at all on Windows.
+
+The candidate-ordering test asserted `parent_pid()` was present, which is a unix-only guarantee, and re-implemented the classification instead of calling it. Ranking became a pure function that the test drives directly on every platform.
+
+The lesson is the boring one: a compile check is not a test, and the dry run before the tag is what turns that from an outage into a commit.
+
 ### Prototype
 
 First working version, verified end to end against Chan 0.84.1: pick an agent, it spawns on side B, a message typed in the chat tab reaches it and submits, the agent answers with a survey overlay, and the health strip tracks it.
