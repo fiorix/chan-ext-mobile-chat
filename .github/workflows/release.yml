@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Release checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Check release tooling
+        shell: bash
+        run: |
+          shellcheck install.sh scripts/*.sh scripts/tests/*.sh
+          python -m py_compile scripts/package-chan-extension.py scripts/tests/test_package_chan_extension.py
+          python -m unittest discover -s scripts/tests -p 'test_*.py'
+          ./scripts/tests/install-release.sh
+      - name: Check the Rust gate
+        shell: bash
+        run: ./scripts/gate.sh
+      - name: Check tag version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          workspace_version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$GITHUB_REF_NAME" != "v${workspace_version}" ]]; then
+            printf 'tag %s does not match workspace version %s\n' "$GITHUB_REF_NAME" "$workspace_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.package_target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            package_target: linux-x86_64
+            binary: target/x86_64-unknown-linux-musl/release/mobile-chat-extension
+            archive: mobile-chat-linux-x86_64.tar.gz
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            package_target: linux-aarch64
+            binary: target/aarch64-unknown-linux-musl/release/mobile-chat-extension
+            archive: mobile-chat-linux-aarch64.tar.gz
+          - runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+            package_target: windows-x86_64
+            binary: target/x86_64-pc-windows-msvc/release/mobile-chat-extension.exe
+            archive: mobile-chat-windows-x86_64.zip
+          - runner: macos-14
+            rust_target: aarch64-apple-darwin
+            package_target: macos-aarch64
+            binary: target/aarch64-apple-darwin/release/mobile-chat-extension
+            archive: mobile-chat-macos-aarch64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install the musl toolchain
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Install the Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
+      - name: Test the extension
+        shell: bash
+        run: >-
+          cargo test --locked --release -p mobile-chat-extension
+          --target "${{ matrix.rust_target }}"
+      - name: Build the extension
+        shell: bash
+        run: >-
+          cargo build --locked --release -p mobile-chat-extension
+          --target "${{ matrix.rust_target }}"
+      - name: Assemble the release archive
+        shell: bash
+        run: |
+          python scripts/package-chan-extension.py \
+            --target "${{ matrix.package_target }}" \
+            --binary "${{ matrix.binary }}" \
+            --output-dir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.package_target }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - check
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          expected=(
+            mobile-chat-linux-x86_64.tar.gz
+            mobile-chat-linux-aarch64.tar.gz
+            mobile-chat-windows-x86_64.zip
+            mobile-chat-macos-aarch64.tar.gz
+          )
+          for archive in "${expected[@]}"; do
+            [[ -f "dist/$archive" ]] || { printf 'missing %s\n' "$archive" >&2; exit 1; }
+          done
+          cp install.sh dist/install.sh
+          (
+            cd dist
+            sha256sum "${expected[@]}" >SHA256SUMS
+          )
+      - name: Create or update the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

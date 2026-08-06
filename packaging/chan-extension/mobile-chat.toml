@@ -1,0 +1,4 @@
+name = "Mobile Chat"
+command = "/absolute/path/to/mobile-chat-extension"
+args = []
+capabilities = ["session-context"]

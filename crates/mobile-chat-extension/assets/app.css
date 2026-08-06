@@ -1,0 +1,204 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --line: #dcdcdc;
+  --field: #f6f6f6;
+  --accent: #2f6feb;
+  --ok: #2f9e44;
+  --warn: #e8a317;
+  --bad: #d64545;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a;
+    --fg: #ededed;
+    --muted: #9a9a9a;
+    --line: #33353a;
+    --field: #202226;
+    --accent: #5b8dfa;
+    --ok: #51cf66;
+    --warn: #ffc94d;
+    --bad: #ff6b6b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* A class-level `display` beats the UA stylesheet's `[hidden] { display: none }`,
+   so every section styled as a flex container would ignore the attribute the
+   render pass sets. Restore the attribute as the authority. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+}
+
+.spacer {
+  flex: 1;
+}
+
+.strip {
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+#headline {
+  flex: 1;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dot {
+  background: var(--muted);
+  border-radius: 50%;
+  flex: none;
+  height: 10px;
+  width: 10px;
+}
+
+.dot[data-phase="live"] {
+  background: var(--ok);
+}
+
+.dot[data-phase="spawning"],
+.dot[data-phase="booting"] {
+  background: var(--accent);
+}
+
+.dot[data-phase="stalled"] {
+  background: var(--warn);
+}
+
+.dot[data-phase="dead"],
+.dot[data-phase="failed"] {
+  background: var(--bad);
+}
+
+.detail {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.picker label {
+  color: var(--muted);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+select,
+textarea {
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: inherit;
+  font: inherit;
+  padding: 10px;
+  width: 100%;
+}
+
+textarea {
+  resize: vertical;
+}
+
+button {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+  font: inherit;
+  min-height: 40px;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+
+.ghost {
+  background: transparent;
+  color: inherit;
+}
+
+.danger {
+  background: transparent;
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.recovery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.count {
+  color: var(--muted);
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.count[data-over="true"] {
+  color: var(--bad);
+}
+
+.notice {
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding-left: 10px;
+}
+
+.notice[data-ok="false"] {
+  border-left-color: var(--bad);
+  color: var(--bad);
+}

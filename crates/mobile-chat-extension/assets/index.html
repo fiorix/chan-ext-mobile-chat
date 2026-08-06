@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Mobile Chat</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <main id="app">
+      <header id="strip" class="strip">
+        <span id="dot" class="dot"></span>
+        <span id="headline">Connecting</span>
+        <button id="peek" type="button" class="ghost" hidden>Peek</button>
+      </header>
+
+      <p id="detail" class="detail" hidden></p>
+
+      <section id="picker" class="picker" hidden>
+        <label for="agent">Agent</label>
+        <div class="row">
+          <select id="agent"></select>
+          <button id="start" type="button" class="primary">Start</button>
+        </div>
+      </section>
+
+      <section id="recovery" class="recovery" hidden>
+        <button id="nudge" type="button" class="ghost">Nudge</button>
+        <button id="escape" type="button" class="ghost">Escape</button>
+        <button id="restart" type="button" class="ghost">Restart</button>
+        <button id="close" type="button" class="danger">Close</button>
+      </section>
+
+      <div class="spacer"></div>
+
+      <section id="composer" class="composer" hidden>
+        <textarea
+          id="text"
+          rows="3"
+          placeholder="Message the agent"
+          autocomplete="off"
+          autocapitalize="sentences"
+        ></textarea>
+        <div class="row">
+          <span id="count" class="count"></span>
+          <button id="send" type="button" class="primary">Send</button>
+        </div>
+      </section>
+
+      <p id="notice" class="notice" hidden></p>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

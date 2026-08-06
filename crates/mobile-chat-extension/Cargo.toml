@@ -1,0 +1,25 @@
+[package]
+name = "mobile-chat-extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mobile-chat-extension"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+
+[lints]
+workspace = true
