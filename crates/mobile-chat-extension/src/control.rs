@@ -198,14 +198,14 @@ fn socket_candidates() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(tail) = socket_tail(name) else {
+            let Some(rank) = socket_rank(name, parent) else {
                 continue;
             };
             let path = entry.path();
-            match parent {
-                Some(pid) if tail.starts_with(&format!("{pid}-")) => pid_named.push(path),
-                _ if tail.starts_with('s') => stable.push(path),
-                _ => rest.push(path),
+            match rank {
+                Rank::ParentPid => pid_named.push(path),
+                Rank::Stable => stable.push(path),
+                Rank::Other => rest.push(path),
             }
         }
     }
@@ -218,17 +218,44 @@ fn socket_candidates() -> Vec<PathBuf> {
     pid_named
 }
 
+/// How promising a candidate is, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rank {
+    /// Named for the pid of our parent, which is the serving chan-server.
+    ParentPid,
+    /// A stable-named devserver socket, which carries no pid to match on.
+    Stable,
+    /// Some other chan server's socket. Still worth probing, just last.
+    Other,
+}
+
 /// The part of a chan control socket's file name after the prefix, or `None`
-/// when the name is not one. The `.sock` suffix is a unix convention: a Windows
-/// named pipe under `\\.\pipe\` carries the same name with no extension, which
-/// is the same rule `chan ps` applies.
+/// when the name is not one.
+///
+/// The `.sock` suffix is a unix convention. The same socket on Windows is a
+/// named pipe under `\\.\pipe\` with no extension at all, which is the rule
+/// `chan ps` applies. That directory lists every named pipe on the machine, so
+/// the check still has to be exact: a name carrying some other extension is
+/// somebody else's pipe, not ours.
 fn socket_tail(name: &str) -> Option<&str> {
     let tail = name.strip_prefix("chan-control-")?;
-    if cfg!(windows) {
-        Some(tail.strip_suffix(".sock").unwrap_or(tail))
-    } else {
-        tail.strip_suffix(".sock")
-    }
+    let tail = match tail.strip_suffix(".sock") {
+        Some(stripped) => stripped,
+        // An extension-less name is a Windows pipe; on unix it is not ours.
+        None if cfg!(windows) => tail,
+        None => return None,
+    };
+    (!tail.is_empty() && !tail.contains('.')).then_some(tail)
+}
+
+/// Rank one directory entry, or `None` when it is not a chan control socket.
+fn socket_rank(name: &str, parent: Option<u32>) -> Option<Rank> {
+    let tail = socket_tail(name)?;
+    Some(match parent {
+        Some(pid) if tail.starts_with(&format!("{pid}-")) => Rank::ParentPid,
+        _ if tail.starts_with('s') => Rank::Stable,
+        _ => Rank::Other,
+    })
 }
 
 /// Where chan keeps its control sockets: a named pipe directory on Windows, a
@@ -288,47 +315,40 @@ mod tests {
     }
 
     #[test]
-    fn candidates_prefer_our_parents_sockets_and_skip_unrelated_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid = parent_pid().expect("unix test");
-        for name in [
-            "chan-control-s0123456789abcdef.sock",
-            &format!("chan-control-{pid}-deadbeef.sock"),
-            "chan-control-99999999-cafe.sock",
-            "not-a-chan-socket",
-            "chan-control-broken.txt",
-        ] {
-            std::fs::write(dir.path().join(name), b"").unwrap();
-        }
-        // SAFETY-free scan of just this directory, mirroring socket_candidates'
-        // classification without depending on the machine's real /tmp.
-        let mut pid_named = Vec::new();
-        let mut stable = Vec::new();
-        let mut rest = Vec::new();
-        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
-            let name = entry.file_name();
-            let name = name.to_str().unwrap().to_string();
-            let Some(tail) = name.strip_prefix("chan-control-") else {
-                continue;
-            };
-            if !tail.ends_with(".sock") {
-                continue;
-            }
-            if tail.starts_with(&format!("{pid}-")) {
-                pid_named.push(name);
-            } else if tail.starts_with('s') {
-                stable.push(name);
-            } else {
-                rest.push(name);
-            }
-        }
+    fn candidates_prefer_our_parents_socket_and_skip_unrelated_names() {
+        let parent = Some(4242);
         assert_eq!(
-            pid_named.len(),
-            1,
-            "our parent's socket is classified first"
+            socket_rank("chan-control-4242-deadbeef.sock", parent),
+            Some(Rank::ParentPid),
+            "our parent's socket is tried first"
         );
-        assert_eq!(stable.len(), 1, "stable devserver socket is a fallback");
-        assert_eq!(rest.len(), 1, "another process's socket is last");
+        assert_eq!(
+            socket_rank("chan-control-s0123456789abcdef.sock", parent),
+            Some(Rank::Stable),
+            "a stable devserver socket carries no pid, so it is a fallback"
+        );
+        assert_eq!(
+            socket_rank("chan-control-99999999-cafe.sock", parent),
+            Some(Rank::Other),
+            "another server's socket is still probed, just last"
+        );
+        for unrelated in ["not-a-chan-socket", "chan-control-broken.txt", "sshd.pipe"] {
+            assert_eq!(socket_rank(unrelated, parent), None, "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn without_a_parent_pid_every_socket_is_still_a_candidate() {
+        // Windows has no portable parent pid. Losing it costs ordering, never
+        // reachability: the probe settles which socket serves our window.
+        assert_eq!(
+            socket_rank("chan-control-4242-deadbeef.sock", None),
+            Some(Rank::Other)
+        );
+        assert_eq!(
+            socket_rank("chan-control-s0123456789abcdef.sock", None),
+            Some(Rank::Stable)
+        );
     }
 
     #[test]
@@ -350,11 +370,20 @@ mod tests {
         // extension, which is the rule `chan ps` applies.
         assert_eq!(socket_tail("chan-control-42-abc.sock"), Some("42-abc"));
         assert_eq!(socket_tail("not-a-chan-socket"), None);
-        assert_eq!(socket_tail("chan-control-broken.txt"), None);
         assert_eq!(
             socket_tail("chan-control-42-abc"),
             cfg!(windows).then_some("42-abc"),
             "an extension-less name is a pipe on Windows and noise on unix"
         );
+        // `\\.\pipe\` lists every named pipe on the machine, so a name with
+        // some other extension must be rejected on Windows too.
+        for foreign in [
+            "chan-control-broken.txt",
+            "chan-control-42-abc.log",
+            "chan-control-.sock",
+            "chan-control-",
+        ] {
+            assert_eq!(socket_tail(foreign), None, "{foreign}");
+        }
     }
 }
