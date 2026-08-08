@@ -11,14 +11,27 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::Deserialize;
 
-/// The submit chords Chan knows (`SubmitAgent` in chan-shell). A chord is the
-/// byte sequence that makes a prompt FIRE in that agent's compose box instead
-/// of sitting in it, so naming the right one is the difference between a
-/// message being answered and a message being ignored.
-pub const SUBMIT_CHORDS: &[&str] = &["claude", "codex", "kimi", "gemini", "opencode"];
-
-/// Agents offered when the config file names none.
-const DEFAULT_AGENTS: &[&str] = SUBMIT_CHORDS;
+/// The agents Chan knows a submit chord for (`SubmitAgent` in chan-shell),
+/// each paired with the flag that starts it without a permission gate.
+///
+/// A chord is the byte sequence that makes a prompt FIRE in that agent's
+/// compose box instead of sitting in it, so naming the right one is the
+/// difference between a message being answered and a message being ignored.
+///
+/// The flag answers the other half of the same problem. This extension's only
+/// reply channel is `cs terminal survey`; an agent that stops at its own
+/// permission prompt never reaches it, and that prompt lives in a terminal
+/// nobody is looking at, so the session just goes quiet. `claude` gets
+/// `--permission-mode bypassPermissions` rather than
+/// `--dangerously-skip-permissions` because the latter opens a one-time
+/// consent screen that is exactly the kind of prompt this is meant to avoid.
+const KNOWN_AGENTS: &[(&str, &str)] = &[
+    ("claude", "--permission-mode bypassPermissions"),
+    ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+    ("kimi", "--auto"),
+    ("gemini", "--yolo"),
+    ("opencode", "--auto"),
+];
 
 /// Cap on the config file, so a stray large file cannot be slurped whole.
 const CONFIG_LIMIT_BYTES: u64 = 64 * 1024;
@@ -32,9 +45,8 @@ pub struct Config {
     #[serde(default = "default_agents")]
     pub agents: Vec<String>,
 
-    /// Per-agent overrides. The command is free-form: Chan runs a member
-    /// command through `$SHELL -lc`, so arguments, wrappers, and shell syntax
-    /// all work.
+    /// Per-agent overrides. The command is free-form: Chan spawns it through a
+    /// shell, so arguments, wrappers, and shell syntax all work.
     #[serde(default)]
     pub agent: BTreeMap<String, AgentOverride>,
 
@@ -45,9 +57,14 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOverride {
-    /// Command the terminal spawns, free-form. Chan runs it through
-    /// `$SHELL -lc`, so `my-shell-script --flag` works as written and the
-    /// login shell's PATH applies. Defaults to the roster name.
+    /// Command the terminal spawns, free-form: Chan runs it through a shell,
+    /// so `my-shell-script --flag` works as written. That shell does not read
+    /// your login files, so an agent your shell rc puts on PATH needs an
+    /// absolute path here.
+    ///
+    /// Defaults to the roster name plus that agent's permission-bypass flag.
+    /// Naming a command replaces both halves, so carry the flag yourself or
+    /// the agent will stop at a prompt nobody can see.
     pub command: Option<String>,
     /// Which submit chord to send. Becomes `CHAN_AGENT`, which is what pins
     /// Chan's chord selection when the command does not name a known agent.
@@ -59,7 +76,8 @@ pub struct AgentOverride {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
-    /// How long to wait for a spawned agent to appear in `cs terminal list`.
+    /// How long a spawned agent has to appear in `cs terminal list` and then
+    /// come ready for input. Both are the same deadline, counted from spawn.
     #[serde(default = "default_boot_timeout_secs")]
     pub boot_timeout_secs: u64,
     /// Interval between health polls.
@@ -79,7 +97,34 @@ pub struct Agent {
 }
 
 fn default_agents() -> Vec<String> {
-    DEFAULT_AGENTS.iter().map(|a| (*a).to_string()).collect()
+    KNOWN_AGENTS
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Whether Chan knows this name as a submit chord.
+fn is_known_chord(name: &str) -> bool {
+    KNOWN_AGENTS.iter().any(|(known, _)| *known == name)
+}
+
+/// The known names, for an error message that names the way out.
+fn known_chords() -> String {
+    KNOWN_AGENTS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What a bare roster name spawns: the agent, plus the flag that keeps it from
+/// stopping to ask for permission. `None` for a name Chan does not know, whose
+/// launcher flags are not ours to guess.
+fn default_command(name: &str) -> Option<String> {
+    KNOWN_AGENTS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(agent, bypass)| format!("{agent} {bypass}"))
 }
 
 fn default_boot_timeout_secs() -> u64 {
@@ -167,30 +212,32 @@ impl Config {
                     .and_then(|o| o.command.as_deref())
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
-                    .unwrap_or(name);
+                    .map(str::to_string)
+                    .or_else(|| default_command(name))
+                    .unwrap_or_else(|| name.to_string());
                 let declared = over
                     .and_then(|o| o.submit_chord.as_deref())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let submit_chord = match declared {
                     Some(chord) => chord,
-                    None if SUBMIT_CHORDS.contains(&name) => name,
+                    None if is_known_chord(name) => name,
                     None => anyhow::bail!(
                         "agent {name:?} is not one of the known chords, so it needs \
                          a [agent.{name}] section with submit_chord = one of {}",
-                        SUBMIT_CHORDS.join(", ")
+                        known_chords()
                     ),
                 };
-                if !SUBMIT_CHORDS.contains(&submit_chord) {
+                if !is_known_chord(submit_chord) {
                     anyhow::bail!(
                         "agent {name:?} declares submit_chord = {submit_chord:?}, \
                          which chan does not know; use one of {}",
-                        SUBMIT_CHORDS.join(", ")
+                        known_chords()
                     );
                 }
                 Ok(Agent {
                     name: name.to_string(),
-                    command: command.to_string(),
+                    command,
                     submit_chord: submit_chord.to_string(),
                 })
             })
@@ -232,15 +279,47 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_name_becomes_its_own_command_and_chord() {
+    fn a_bare_name_becomes_its_own_chord_and_a_command_that_will_not_stop_to_ask() {
         let config = Config::default();
         let claude = config
             .roster()
             .into_iter()
             .find(|a| a.name == "claude")
             .unwrap();
-        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.command, "claude --permission-mode bypassPermissions");
         assert_eq!(claude.submit_chord, "claude");
+    }
+
+    #[test]
+    fn every_default_agent_launches_itself_with_a_bypass_flag() {
+        // A permission prompt is invisible from the chat tab, so an agent that
+        // can still raise one is an agent the phone cannot talk to.
+        for agent in Config::default().roster() {
+            let (program, flags) = agent
+                .command
+                .split_once(' ')
+                .expect("a default command carries a flag");
+            assert_eq!(program, agent.name, "the program is still the agent");
+            assert!(flags.starts_with("--"), "{}: {flags:?}", agent.name);
+            assert_eq!(agent.submit_chord, agent.name);
+        }
+    }
+
+    #[test]
+    fn a_declared_command_is_spawned_verbatim() {
+        // The flags of somebody else's launcher are not ours to guess, so a
+        // command that names itself owns its own permission story.
+        let (_dir, path) = write(
+            "agents = [\"claude\"]\n\
+             [agent.claude]\n\
+             command = \"/opt/bin/claude\"\n",
+        );
+        let agent = Config::load(&path).unwrap().roster().remove(0);
+        assert_eq!(agent.command, "/opt/bin/claude");
+        assert_eq!(
+            agent.submit_chord, "claude",
+            "the roster name still picks the chord"
+        );
     }
 
     fn write(body: &str) -> (tempfile::TempDir, PathBuf) {

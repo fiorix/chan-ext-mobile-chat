@@ -1,16 +1,23 @@
 //! One chat session: spawn an agent, keep talking to it, watch it for trouble.
 //!
-//! The agent runs as a Chan "team of one". That is not decoration: Chan derives
-//! a terminal's submit chord from the PTY's spawn command and `CHAN_AGENT` spawn
-//! env, never from what is running inside it. A plain `cs terminal new` tab
-//! spawns the tenant shell, so a `claude` started by typing into it stays a
+//! The agent IS the terminal's spawn command, never something typed into a
+//! shell. That is not decoration: Chan derives a terminal's submit chord from
+//! the PTY's spawn command and `CHAN_AGENT` spawn env, never from what is
+//! running inside it, so a `claude` started by typing into a shell tab stays a
 //! shell session and every `cs terminal write --submit=claude` is refused with
-//! exit 69, parking the text un-submitted in the agent's compose box (measured,
-//! not assumed). A team member's command IS the agent, which fixes the chord and
-//! additionally buys Chan's own bracketed-paste readiness gate and the
-//! `window_id` binding that `cs terminal survey` needs to find a window.
+//! exit 69, parking the text un-submitted in the compose box (measured, not
+//! assumed). `cs terminal new --command ... --env CHAN_AGENT=...` fixes the
+//! chord at spawn, and binds the tab to the calling window, which is what
+//! `cs terminal survey` needs to raise an overlay.
+//!
+//! What that route does not bring is a readiness gate. `cs terminal team`
+//! waits for each member's PTY to enable bracketed-paste mode before poking it;
+//! a plain `new` pokes nothing at all. So this module keeps the gate itself and
+//! watches for the same signal, because the brief has to land in a TUI that is
+//! already listening.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,18 +28,18 @@ use tokio::sync::{Mutex, broadcast};
 use crate::config::{Agent, Config};
 use crate::control::{Cs, EXIT_SUBMIT_REFUSED};
 
-/// The reusable team directory, workspace-relative. `.chan/` is hard-skipped by
-/// Chan's workspace walker, indexer, and file watcher, so the scaffolding never
-/// shows up in the tree, in search, or in the graph. One stable directory is
-/// reused across sessions rather than accumulating one per run.
-pub const TEAM_DIR: &str = ".chan/mobile-chat";
-
 /// Terminal group for every spawned agent.
 const TAB_GROUP: &str = "mobile-chat";
 
 /// `cs terminal write` refuses anything larger, and truncating a prompt is worse
 /// than refusing it.
 pub const MAX_WRITE_BYTES: usize = 4096;
+
+/// DECSET 2004. An agent's TUI turns bracketed paste on once it is ready to
+/// take input, which is the same signal Chan's own team spawn waits for before
+/// poking a member. Anything written before it goes into a PTY that is not
+/// listening yet, and is simply lost.
+const BRACKETED_PASTE_ON: &str = "\u{1b}[?2004h";
 
 /// Substrings that mean the agent command never really started.
 const FATAL_MARKERS: &[&str] = &[
@@ -48,11 +55,12 @@ const FATAL_MARKERS: &[&str] = &[
 pub enum Phase {
     /// No agent picked yet.
     Idle,
-    /// `cs terminal team new` is running.
+    /// `cs terminal new` is running.
     Spawning,
-    /// Spawn returned cleanly; waiting for the tab to appear in the registry.
+    /// Spawn was accepted; waiting for the tab to appear in the registry, come
+    /// ready for input, and take its brief.
     Booting,
-    /// The tab is in the registry under the expected agent.
+    /// Briefed, and ready for the user's own messages.
     Live,
     /// Queued input is not draining and output has not changed.
     Stalled,
@@ -99,6 +107,10 @@ pub struct Chat {
     config: Config,
     session: Mutex<Option<Session>>,
     updates: broadcast::Sender<String>,
+    /// Which watcher owns the session. Every spawn and every restart takes the
+    /// next number, so an older watcher notices it has been superseded and
+    /// stops rather than racing the new one through the boot sequence.
+    watch_epoch: AtomicU64,
 }
 
 impl Chat {
@@ -109,6 +121,7 @@ impl Chat {
             config,
             session: Mutex::new(None),
             updates,
+            watch_epoch: AtomicU64::new(0),
         })
     }
 
@@ -193,12 +206,11 @@ impl Chat {
             }
         }
 
-        // Check the command resolves BEFORE spawning anything. A command that
-        // is not on the login shell's PATH exits 127 immediately, and the
-        // registry drops the session before its scrollback can be read, so
-        // after the fact all Chan can report is "terminal ended before
-        // enabling bracketed-paste mode". Asking first turns that into the
-        // real answer and leaves no dead tab behind.
+        // Check the command resolves BEFORE spawning anything. A command the
+        // shell cannot find exits 127 at once, and the tab is gone from the
+        // registry before its scrollback can be read (measured: it never
+        // appears at all), leaving the boot timeout as the only report and
+        // "did not start" as the only cause. Asking first names the real one.
         preflight(&agent.command).await?;
 
         let handle = format!("@@chat-{}", short_id());
@@ -219,49 +231,24 @@ impl Chat {
         });
         self.publish().await;
 
-        let scratch = tempfile::tempdir().context("creating the team scratch directory")?;
-        let config_path = scratch.path().join("config.toml");
-        let brief_path = scratch.path().join("brief.md");
-        std::fs::write(&config_path, team_config_toml(&handle, &agent))
-            .context("writing the team config")?;
-        std::fs::write(&brief_path, brief(&handle)).context("writing the brief")?;
-
-        let mut args = vec![
-            "terminal".to_string(),
-            "team".to_string(),
-            "new".to_string(),
-            TEAM_DIR.to_string(),
-            "--config".to_string(),
-            config_path.display().to_string(),
-            "--brief".to_string(),
-            brief_path.display().to_string(),
-        ];
-        if let Some(pane) = &pane_id {
-            args.push("--pane".to_string());
-            args.push(pane.clone());
-        }
-        args.push("--side".to_string());
-        args.push("b".to_string());
-
-        let out = self.cs.run(window_id, &args).await?;
+        let out = self
+            .cs
+            .run(window_id, spawn_args(&handle, &agent, pane_id.as_deref()))
+            .await?;
         if !out.ok() {
-            // Chan reports a failed spawn in its own terms ("terminal ended
-            // before enabling bracketed-paste mode"), which describes the
-            // symptom. The tab is still there holding the shell's actual
-            // complaint, so read it and lead with the real cause.
-            let cause = cause_suffix(self.captured_cause(window_id, &handle).await);
-            self.fail(format!(
-                "could not start {}{cause}: {}",
-                agent.name,
-                out.message()
-            ))
-            .await;
+            // A refusal here is the request never reaching a window at all, so
+            // there is no tab to read a cause from; the message is Chan's own.
+            self.fail(format!("could not start {}: {}", agent.name, out.message()))
+                .await;
             return Ok(());
         }
 
         {
             let mut guard = self.session.lock().await;
             if let Some(session) = guard.as_mut() {
+                // The ack only means the request was queued to the window:
+                // `cs terminal new` creates the tab asynchronously, so every
+                // way this can still fail is the watcher's to notice.
                 session.phase = Phase::Booting;
                 session.started = Instant::now();
                 session.last_change = Instant::now();
@@ -269,14 +256,21 @@ impl Chat {
         }
         self.publish().await;
 
-        let watcher = Arc::clone(self);
-        tokio::spawn(async move { watcher.watch().await });
+        self.spawn_watcher();
         Ok(())
+    }
+
+    /// Take ownership of the session and start watching it, retiring whichever
+    /// watcher held it before.
+    fn spawn_watcher(self: &Arc<Self>) {
+        let epoch = self.watch_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let watcher = Arc::clone(self);
+        tokio::spawn(async move { watcher.watch(epoch).await });
     }
 
     /// Send one user message to the agent, submitted rather than parked.
     pub async fn send(&self, text: &str) -> Result<String> {
-        let (handle, agent, window_id) = self.target().await?;
+        let (handle, agent, window_id) = self.ready_target().await?;
         if text.trim().is_empty() {
             anyhow::bail!("nothing to send");
         }
@@ -286,15 +280,26 @@ impl Chat {
                 text.len()
             );
         }
+        self.submit(&window_id, &handle, &agent, text).await
+    }
+
+    /// One submitted write: the text, then Chan's chord for this agent.
+    async fn submit(
+        &self,
+        window_id: &str,
+        handle: &str,
+        agent: &Agent,
+        text: &str,
+    ) -> Result<String> {
         let out = self
             .cs
             .run(
-                &window_id,
+                window_id,
                 [
                     "terminal",
                     "write",
                     "--tab-name",
-                    &handle,
+                    handle,
                     &format!("--submit={}", agent.submit_chord),
                     text,
                 ],
@@ -372,7 +377,7 @@ impl Chat {
 
     /// Respawn the PTY with the same command and env, dropping the write queue.
     /// The only lever that bypasses a wedged queue.
-    pub async fn restart(&self) -> Result<String> {
+    pub async fn restart(self: &Arc<Self>) -> Result<String> {
         let (handle, _, window_id) = self.target().await?;
         let result = self
             .expect_ok(
@@ -392,9 +397,18 @@ impl Chat {
             session.started = Instant::now();
             session.last_change = Instant::now();
             session.queue_depth = 0;
+            // The respawn clears the replay ring (measured), so the readiness
+            // gate reads the new run's own output and the brief goes in again.
+            // A restarted agent remembers nothing, including that it is being
+            // talked to from a phone.
+            session.digest = 0;
+            session.last_scrollback.clear();
         }
         drop(guard);
         self.publish().await;
+        // Restarting out of dead or failed means the previous watcher has
+        // already returned, and booting is a phase only a watcher can leave.
+        self.spawn_watcher();
         Ok(result)
     }
 
@@ -434,15 +448,18 @@ impl Chat {
         ))
     }
 
-    /// Read a just-failed tab's scrollback and reduce it to a cause, if it
-    /// names one. Best effort: a tab that is already gone yields nothing.
-    async fn captured_cause(&self, window_id: &str, handle: &str) -> Option<String> {
-        self.cs
-            .run(window_id, ["terminal", "scrollback", "--tab-name", handle])
-            .await
-            .ok()
-            .filter(|out| out.ok())
-            .and_then(|out| post_mortem(&out.stdout))
+    /// The target, refused while the agent is still coming up. A user message
+    /// that overtook the brief would reach an agent that does not yet know the
+    /// only way to answer it.
+    async fn ready_target(&self) -> Result<(String, Agent, String)> {
+        {
+            let guard = self.session.lock().await;
+            let session = guard.as_ref().context("no agent is running")?;
+            if matches!(session.phase, Phase::Spawning | Phase::Booting) {
+                anyhow::bail!("{} is still coming up", session.agent.name);
+            }
+        }
+        self.target().await
     }
 
     async fn fail(&self, detail: String) {
@@ -470,8 +487,8 @@ impl Chat {
         own_pane_from_layout(&layout)
     }
 
-    /// The health loop. Runs while a session exists.
-    async fn watch(self: Arc<Self>) {
+    /// The health loop. Runs while this watcher owns a live session.
+    async fn watch(self: Arc<Self>, epoch: u64) {
         let interval = Duration::from_secs(self.config.health.poll_interval_secs.max(1));
         let boot_timeout = Duration::from_secs(self.config.health.boot_timeout_secs.max(1));
         let stall_after = Duration::from_secs(self.config.health.stall_after_secs.max(1));
@@ -479,6 +496,9 @@ impl Chat {
         loop {
             tokio::time::sleep(interval).await;
 
+            if self.watch_epoch.load(Ordering::SeqCst) != epoch {
+                return;
+            }
             let Some((handle, agent, window_id, phase)) = ({
                 let guard = self.session.lock().await;
                 guard.as_ref().map(|s| {
@@ -532,6 +552,7 @@ impl Chat {
                 session.last_scrollback = text;
             }
 
+            let mut ready_to_brief = false;
             match entry {
                 Some(entry) => {
                     let depth = entry
@@ -542,14 +563,22 @@ impl Chat {
                         session.queue_depth = depth;
                         session.last_change = Instant::now();
                     }
-                    let listed_agent = entry.get("agent").and_then(Value::as_str);
                     if session.phase == Phase::Booting {
-                        session.phase = Phase::Live;
-                        session.detail = match listed_agent {
-                            Some(name) => format!("{name} is up"),
-                            None => "up, but chan derived no agent for this tab".into(),
-                        };
-                        session.last_change = Instant::now();
+                        // The tab exists; what is left is a TUI that will
+                        // actually receive what we write into it.
+                        if session.last_scrollback.contains(BRACKETED_PASTE_ON) {
+                            ready_to_brief = true;
+                        } else if session.started.elapsed() >= boot_timeout {
+                            session.phase = Phase::Failed;
+                            session.detail = format!(
+                                "{} never became ready for input within {}s{}",
+                                agent.name,
+                                boot_timeout.as_secs(),
+                                cause_suffix(post_mortem(&session.last_scrollback))
+                            );
+                        } else {
+                            session.detail = format!("waiting for {} to accept input", agent.name);
+                        }
                     } else if depth > 0 && session.last_change.elapsed() >= stall_after {
                         session.phase = Phase::Stalled;
                         session.detail = format!(
@@ -588,8 +617,77 @@ impl Chat {
             if done {
                 return;
             }
+            if ready_to_brief && !self.deliver_brief(epoch, &window_id, &handle, &agent).await {
+                return;
+            }
         }
     }
+
+    /// Hand the agent its brief, and open the session for the user's own
+    /// messages. Returns whether the session is still worth watching.
+    async fn deliver_brief(
+        &self,
+        epoch: u64,
+        window_id: &str,
+        handle: &str,
+        agent: &Agent,
+    ) -> bool {
+        let delivered = self.submit(window_id, handle, agent, &brief(handle)).await;
+
+        let mut guard = self.session.lock().await;
+        // A restart or a fresh agent while the write was in flight hands the
+        // session to a newer watcher, and a close leaves no session at all.
+        // Either way this brief is about a session that no longer exists.
+        if self.watch_epoch.load(Ordering::SeqCst) != epoch {
+            return false;
+        }
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        match delivered {
+            Ok(_) => {
+                session.phase = Phase::Live;
+                session.detail = format!("{} is up", agent.name);
+                session.last_change = Instant::now();
+            }
+            // Nothing else can be said to an agent that cannot be written to,
+            // and exit 69 here means Chan derived no chord for the tab, so
+            // every later message would park un-submitted too.
+            Err(error) => {
+                session.phase = Phase::Failed;
+                session.detail = format!("{} came up but took no brief: {error:#}", agent.name);
+            }
+        }
+        let live = session.phase == Phase::Live;
+        drop(guard);
+        self.publish().await;
+        live
+    }
+}
+
+/// The `cs terminal new` invocation that makes the agent the tab's spawn
+/// command. `CHAN_AGENT` is what pins the submit chord: Chan sniffs the command
+/// otherwise, and a wrapper script sniffs to nothing.
+fn spawn_args(handle: &str, agent: &Agent, pane: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "terminal".to_string(),
+        "new".to_string(),
+        "--tab-name".to_string(),
+        handle.to_string(),
+        "--tab-group".to_string(),
+        TAB_GROUP.to_string(),
+        "--command".to_string(),
+        agent.command.clone(),
+        "--env".to_string(),
+        format!("CHAN_AGENT={}", agent.submit_chord),
+    ];
+    if let Some(pane) = pane {
+        args.push("--pane".to_string());
+        args.push(pane.to_string());
+    }
+    args.push("--side".to_string());
+    args.push("b".to_string());
+    args
 }
 
 /// Find the pane whose side A holds this extension's tab. Falls back to the
@@ -633,11 +731,17 @@ fn find_session(listed: &Value, handle: &str) -> Option<Value> {
 
 /// Refuse a command the login shell cannot resolve, before anything is spawned.
 ///
-/// Chan runs a member command through `$SHELL -lc`, so this asks the same shell
-/// the same question. Only the leading word is checked, and only when it is a
-/// plain program name or path: anything with shell syntax in it is left alone
-/// rather than guessed at, so this can add a clear error but never block a
-/// command that would have worked.
+/// Chan spawns a terminal without reading your login files, so its PATH is a
+/// subset of the login shell's (measured: an agent that only `.profile` puts on
+/// PATH does not resolve there). The check runs one way round on purpose. What
+/// the login shell cannot find, the spawn cannot find either, so a refusal here
+/// is sound; the reverse case falls through to the post-mortem rather than
+/// being blocked on a guess.
+///
+/// Only the leading word is checked, and only when it is a plain program name
+/// or path: anything with shell syntax in it is left alone rather than guessed
+/// at, so this can add a clear error but never block a command that would have
+/// worked.
 async fn preflight(command: &str) -> Result<()> {
     // Windows: Chan picks between PowerShell, cmd, and a POSIX shell at
     // runtime, so there is no single question to ask here. Skipping leaves the
@@ -754,35 +858,15 @@ fn short_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A Chan team config with exactly one member. Chan requires 1 to 9 members and
-/// exactly one lead, so the solo agent is the lead.
-fn team_config_toml(handle: &str, agent: &Agent) -> String {
-    format!(
-        "team_name = \"mobile-chat\"\n\
-         host_name = \"You\"\n\
-         host_handle = \"@@You\"\n\
-         tab_group = \"{TAB_GROUP}\"\n\
-         \n\
-         [[members]]\n\
-         handle = \"{handle}\"\n\
-         command = \"{command}\"\n\
-         is_lead = true\n\
-         env = {{ CHAN_AGENT = \"{submit}\" }}\n",
-        command = toml_escape(&agent.command),
-        submit = toml_escape(&agent.submit_chord),
-        handle = toml_escape(handle),
-    )
-}
-
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// The brief Chan folds verbatim into the team's `bootstrap.md`. It tells the
-/// agent the one thing it cannot observe: nobody is watching its terminal.
+/// The agent's first prompt, delivered once its TUI is ready for input. It
+/// tells the agent the two things it cannot observe: nobody is watching its
+/// terminal, and nothing will stop it before it acts.
+///
+/// This has to fit in one `cs terminal write`, which is why it is a briefing
+/// and not a manual.
 fn brief(handle: &str) -> String {
     format!(
-        "You are talking to a person on a phone through Chan's Mobile Chat extension.\n\
+        "You are talking to a person on a phone through Chan's Mobile Chat extension. Do not answer this message; wait for their first one.\n\
          \n\
          Your terminal is side B of a pane. They are looking at side A, a chat box, and they cannot see anything you print unless they deliberately flip to your side. Assume they will not.\n\
          \n\
@@ -799,7 +883,14 @@ fn brief(handle: &str) -> String {
          - \"host will follow up later\" means they deferred. Stop and wait rather than asking again.\n\
          - To deliver a finished answer that needs no decision, still send a survey with a single `OK` option. The survey is your only way to reach someone who is not watching the terminal.\n\
          \n\
-         Put the substance in the markdown body, not in the title. Keep your terminal output short: it is a log nobody reads, not your reply.\n",
+         Put the substance in the markdown body, not in the title. Keep your terminal output short: it is a log nobody reads, not your reply.\n\
+         \n\
+         You are running with permission checks bypassed, because a permission prompt in your own TUI is invisible from the chat tab and would strand them. So the survey is also your approval gate, and the judgement that would normally be theirs is now yours to exercise. Weigh each action by what it costs if it turns out to be wrong, and survey BEFORE acting when that cost is real:\n\
+         \n\
+         - Ask first: deleting or overwriting work, `git push`, force-push, rewriting history, touching anything outside this workspace, installing or upgrading packages, changing credentials or durable config, spending money, and anything that leaves this machine or that other people will see.\n\
+         - Just do it: reading, searching, running tests and builds, and edits inside the workspace that git can undo.\n\
+         \n\
+         When you cannot tell which of those an action is, that uncertainty is the answer: ask. One survey costs them a tap. The alternative is an irreversible action taken by an agent nobody was watching.\n",
     )
 }
 
@@ -810,53 +901,50 @@ mod tests {
     fn agent() -> Agent {
         Agent {
             name: "claude".into(),
-            command: "claude".into(),
+            command: "claude --permission-mode bypassPermissions".into(),
             submit_chord: "claude".into(),
         }
     }
 
+    /// Read a flag's value out of an argument vector.
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        let at = args.iter().position(|arg| arg.as_str() == name)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
     #[test]
-    fn the_team_config_satisfies_chans_validation() {
-        let toml_text = team_config_toml("@@chat-a1b2c3", &agent());
-        let parsed: toml::Value = toml::from_str(&toml_text).expect("valid toml");
-        let members = parsed["members"].as_array().expect("members array");
-        assert_eq!(members.len(), 1, "chan requires 1 to 9 members");
+    fn the_spawn_makes_the_agent_the_tabs_own_command() {
+        // Chan derives the submit chord from the spawn command and CHAN_AGENT
+        // and from nothing else, so these two are the whole contract: get them
+        // wrong and every write parks un-submitted with exit 69.
+        let args = spawn_args("@@chat-a1b2c3", &agent(), Some("pane-2"));
+        assert_eq!(args[0], "terminal");
+        assert_eq!(args[1], "new");
+        assert_eq!(flag(&args, "--tab-name"), Some("@@chat-a1b2c3"));
         assert_eq!(
-            members
-                .iter()
-                .filter(|m| m["is_lead"].as_bool() == Some(true))
-                .count(),
-            1,
-            "chan requires exactly one lead"
+            flag(&args, "--command"),
+            Some("claude --permission-mode bypassPermissions")
         );
-        assert_eq!(members[0]["handle"].as_str(), Some("@@chat-a1b2c3"));
-        assert_eq!(members[0]["command"].as_str(), Some("claude"));
-        assert_eq!(members[0]["env"]["CHAN_AGENT"].as_str(), Some("claude"));
-        for key in ["team_name", "host_name", "host_handle"] {
-            assert!(
-                !parsed[key].as_str().unwrap_or_default().is_empty(),
-                "{key} must be non-empty"
-            );
-        }
+        assert_eq!(flag(&args, "--env"), Some("CHAN_AGENT=claude"));
+        assert_eq!(flag(&args, "--tab-group"), Some(TAB_GROUP));
+        assert_eq!(flag(&args, "--pane"), Some("pane-2"));
+        assert_eq!(flag(&args, "--side"), Some("b"), "the agent lands opposite");
     }
 
     #[test]
     fn a_wrapper_command_still_pins_the_chord_through_chan_agent() {
+        // The command sniff resolves nothing here, so CHAN_AGENT is the only
+        // thing standing between this tab and a chordless shell session.
         let wrapper = Agent {
             name: "mine".into(),
-            command: "./my \"agent\".sh".into(),
+            command: "./my \"agent\".sh --yolo".into(),
             submit_chord: "claude".into(),
         };
-        let parsed: toml::Value = toml::from_str(&team_config_toml("@@chat-1", &wrapper)).unwrap();
-        assert_eq!(
-            parsed["members"][0]["command"].as_str(),
-            Some("./my \"agent\".sh"),
-            "quotes in a command survive escaping"
-        );
-        assert_eq!(
-            parsed["members"][0]["env"]["CHAN_AGENT"].as_str(),
-            Some("claude")
-        );
+        let args = spawn_args("@@chat-1", &wrapper, None);
+        assert_eq!(flag(&args, "--command"), Some("./my \"agent\".sh --yolo"));
+        assert_eq!(flag(&args, "--env"), Some("CHAN_AGENT=claude"));
+        assert_eq!(flag(&args, "--pane"), None, "no pane, no --pane");
+        assert_eq!(flag(&args, "--side"), Some("b"));
     }
 
     #[test]
@@ -865,6 +953,48 @@ mod tests {
         assert!(text.contains("cs terminal survey --tab-name @@chat-a1b2c3"));
         assert!(text.contains("1 to 4 options"));
         assert!(text.contains("single `OK` option"));
+    }
+
+    #[test]
+    fn the_brief_makes_the_survey_the_approval_gate_the_bypass_removed() {
+        // Nothing will stop the agent before it acts, so the brief has to say
+        // what to stop for. Naming the cheap side matters as much as the
+        // expensive one: an agent that surveys before reading a file is
+        // useless from a phone.
+        let text = brief("@@chat-a1b2c3");
+        assert!(text.contains("permission checks bypassed"));
+        for irreversible in ["git push", "rewriting history", "spending money"] {
+            assert!(text.contains(irreversible), "unasked: {irreversible}");
+        }
+        assert!(text.contains("Just do it: reading, searching, running tests"));
+    }
+
+    #[test]
+    fn the_brief_fits_in_one_write() {
+        // It goes in as a single `cs terminal write`, which refuses anything
+        // larger rather than truncating it.
+        let text = brief("@@chat-a1b2c3");
+        assert!(
+            text.len() <= MAX_WRITE_BYTES,
+            "the brief is {} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn readiness_is_the_signal_chans_own_team_spawn_waits_for() {
+        // Bracketed paste going on is the TUI saying it will receive what we
+        // write. A banner alone is a process that has started, not one that is
+        // listening.
+        assert!(!"claude v2.1.0 starting\r\n".contains(BRACKETED_PASTE_ON));
+        assert!(
+            "\u{1b}[?1049h\u{1b}[?2004h\u{1b}[2J ready".contains(BRACKETED_PASTE_ON),
+            "the enable sequence is recognized among its neighbours"
+        );
+        assert!(
+            !"\u{1b}[?2004l".contains(BRACKETED_PASTE_ON),
+            "the disable sequence is not readiness"
+        );
     }
 
     #[test]

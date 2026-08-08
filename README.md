@@ -14,11 +14,11 @@ Pick an agent from a dropdown. The extension spawns it in the same pane's B side
  +----------------------+         +----------------------+
 ```
 
-The extension owns very little. Chan already knows how to spawn an agent with the right submit chord, wait for its TUI to come up, deliver a prompt so it fires instead of parking, ask a human a question, and report a terminal's health. Mobile Chat is the phone-shaped front door onto that.
+The extension owns very little. Chan already knows how to spawn an agent with the right submit chord, deliver a prompt so it fires instead of parking, ask a human a question, and report a terminal's health. Mobile Chat is the phone-shaped front door onto that, plus the one part Chan leaves to its caller: waiting until the agent is actually listening before saying anything to it.
 
 ## Install
 
-Chan v0.83.0 or newer discovers local extensions at `~/.chan/extensions`. Install the latest release with:
+Needs Chan v0.86.0 or newer, which is where `cs terminal new` learned `--command` and `--env`; that pair is how the agent becomes the terminal's own spawn command. Chan discovers local extensions at `~/.chan/extensions`. Install the latest release with:
 
 ```sh
 curl -fsSL https://github.com/fiorix/chan-ext-mobile-chat/releases/latest/download/install.sh | bash
@@ -43,15 +43,15 @@ Releases ship native binaries for four targets, each compiled and tested on its 
 
 ## Configuration
 
-Optional, at `<chan-home>/mobile-chat.toml`. With no file you get the five agents Chan knows a submit chord for: claude, codex, kimi, gemini, opencode.
+Optional, at `<chan-home>/mobile-chat.toml`. With no file you get the five agents Chan knows a submit chord for: claude, codex, kimi, gemini, opencode. Each is launched in its no-prompt mode; see [Permissions](#permissions).
 
 ```toml
 # The picker, in order. The first entry is the default.
 agents = ["claude", "codex", "kimi", "work-agent"]
 
-# An agent that is installed somewhere other than PATH.
+# An agent your shell rc puts on PATH, which the spawn does not read.
 [agent.kimi]
-command = "/Users/me/.local/share/kimi/bin/kimi"
+command = "/Users/me/.local/share/kimi/bin/kimi --auto"
 
 # Any command at all, with the chord named explicitly.
 [agent.work-agent]
@@ -59,23 +59,41 @@ command = "my-shell-script --profile work"
 submit_chord = "opencode"
 
 [health]
-boot_timeout_secs = 45     # how long to wait for the agent to appear
+boot_timeout_secs = 45     # how long it has to come up and take its brief
 poll_interval_secs = 5     # how often to check on it
 stall_after_secs = 120     # queued and quiet this long means stuck
 ```
 
-`command` is free-form. Chan runs a member command through `$SHELL -lc`, so arguments, wrappers, and shell syntax all work, and the login shell's PATH applies.
+`command` is free-form: Chan spawns it through a shell, so arguments, wrappers, and shell syntax all work. That shell does not read your login files, so an agent only your shell rc puts on `PATH` needs an absolute path, which is what the `kimi` example above is doing. Naming a command also replaces the default's permission flag.
 
 `submit_chord` (`submit-chord` also works) picks which chord submits your message. It must be one of the five Chan knows, because that name becomes `CHAN_AGENT`, and **Chan silently ignores a value it does not recognize** and goes back to guessing from the command. A guess that comes up empty produces a terminal that accepts messages and never submits them, so the config refuses an unknown chord at startup instead. A roster name that is not itself a known chord must declare one.
 
 The config is read once, at Chan startup. Editing it means restarting Chan.
 
+## Permissions
+
+Every agent is launched in its no-prompt mode. A permission prompt renders inside the agent's TUI, which is the one place the person holding the phone is not looking, so an agent that stops to ask is an agent that has gone silent.
+
+| Agent | Launched as |
+|---|---|
+| claude | `claude --permission-mode bypassPermissions` |
+| codex | `codex --dangerously-bypass-approvals-and-sandbox` |
+| kimi | `kimi --auto` |
+| gemini | `gemini --yolo` |
+| opencode | `opencode --auto` |
+
+claude gets `--permission-mode bypassPermissions` rather than `--dangerously-skip-permissions` because the latter opens a one-time consent screen, which is precisely the prompt this is meant to avoid.
+
+What replaces the permission check is the brief. The agent is told that it is running unattended with the checks off, that the survey is therefore its own approval gate, and which side of the line an action falls on: irreversible or outward-facing work is surveyed first (`git push`, rewriting history, deleting work, anything outside the workspace, installing packages, changing credentials, spending money, anything other people will see), while reading, searching, building, testing, and workspace edits git can undo are not. It is also told that not knowing which of the two an action is counts as a reason to ask.
+
+That is a prompt, not a sandbox. It is the agent's judgement doing the work that a permission dialog used to do, so point this at a workspace you would let an agent loose in.
+
 ## How it works
 
 Chan spawns the extension as a subprocess and reverse-proxies its loopback server into a sandboxed, opaque-origin iframe. From there:
 
-- **Starting an agent** runs `cs terminal team new` with a generated one-member team. This is not incidental. Chan derives a terminal's submit chord from the PTY's **spawn command** and its `CHAN_AGENT` spawn env, never from whatever is running inside it. A tab made with plain `cs terminal new` is a shell, so a `claude` started by typing into it stays a shell session: every `cs terminal write --submit=claude` is refused with exit 69 and the text parks un-submitted in the compose box. Making the agent the member's command fixes the chord, and brings along Chan's own bracketed-paste readiness gate and the `window_id` binding that `cs terminal survey` needs.
-- **The team directory** is `.chan/mobile-chat/` inside the workspace, reused across sessions. Chan's workspace walker, indexer, and file watcher all hard-skip `.chan/`, so it never shows up in the tree, in search, or in the graph. Chan writes team files through a workspace-scoped handle, so this cannot live in `/tmp`.
+- **Starting an agent** runs `cs terminal new --tab-name <handle> --command <agent> --env CHAN_AGENT=<chord>` on side B of the chat tab's pane. Making the agent the tab's own spawn command is not incidental. Chan derives a terminal's submit chord from the PTY's **spawn command** and its `CHAN_AGENT` spawn env, never from whatever is running inside it. A tab spawned as a shell stays a shell session, so a `claude` started by typing into one never earns a chord: every `cs terminal write --submit=claude` is refused with exit 69 and the text parks un-submitted in the compose box.
+- **The brief** is the agent's first prompt, not a file it is pointed at. It goes in once the tab's scrollback shows bracketed-paste mode turning on, which is the same readiness signal Chan's own team spawn waits for before poking a member, and which a plain `cs terminal new` does not wait for on anyone's behalf. Until the brief lands the session stays `booting` and the composer will not send, because a message that overtook the brief would reach an agent that does not yet know the only way to answer it.
 - **Your message** goes out as `cs terminal write --tab-name <handle> --submit=<chord>`, capped at 4096 bytes because that is Chan's limit and truncating a prompt is worse than refusing it.
 - **The agent's reply** comes back as `cs terminal survey`, which the brief tells it to use for questions *and* for finished answers. Chan renders it as a blocking overlay in the window that owns the terminal.
 - **Peek** runs `cs pane focus <pane> --side b` to flip you to the agent. The pane's own side toggle flips back.
@@ -86,7 +104,7 @@ Everything the extension does to Chan goes through the `cs` client, so Chan's se
 
 The health strip reports one of: booting, live, stalled, dead, failed. It polls `cs terminal list --json` for the tab's presence and queue depth, and hashes `cs terminal scrollback` to notice whether output is moving at all.
 
-A command that cannot be resolved is caught **before** anything is spawned, by asking the login shell the same question Chan will (`command -v`). That matters because a command that exits 127 leaves the registry before its scrollback can be read, so after the fact the only available report is Chan's own "terminal ended before enabling bracketed-paste mode", which does not say why.
+A command that cannot be resolved is caught **before** anything is spawned, by asking the login shell to `command -v` it. That matters because a command that exits 127 never reaches the registry at all, so after the fact there is nothing to read and nothing to report but the boot timeout. The check runs one way round on purpose: Chan's spawn does not read your login files, so its `PATH` is the smaller of the two, and what the login shell cannot find the spawn cannot find either. The reverse case gets a dead tab rather than a wrong refusal.
 
 When an agent stalls, the recovery row offers four levers, in order of force. None of them fire on their own.
 
@@ -94,7 +112,7 @@ When an agent stalls, the recovery row offers four levers, in order of force. No
 |---|---|
 | Nudge | Chord-only submit, which fires whatever is parked in the compose box |
 | Escape | A raw ESC with no chord, for an agent sitting in a modal |
-| Restart | Respawns the PTY with the same command and env, dropping the queue |
+| Restart | Respawns the PTY with the same command and env, dropping the queue, and briefs it again |
 | Close | Ends the session |
 
 Nudge and Escape go through the same write queue as everything else, and that queue only drains after 800ms of output quiescence. An agent wedged **while producing output** will not see either of them. Restart is the only lever that bypasses the queue.
@@ -102,6 +120,7 @@ Nudge and Escape go through the same write queue as everything else, and that qu
 ## Limits
 
 - One agent at a time, per Chan workspace.
+- Bracketed-paste mode says the agent's TUI is up, not that it is at a prompt. An agent parked on a first-run gate takes the brief into that dialog instead: codex, for one, asks whether it trusts the directory the first time it runs in it. Start each agent once in the workspace from an ordinary terminal to clear those, then use Peek and Escape if one still catches you.
 - The extension has no host API for layout beyond what `cs` exposes, so it cannot open a window. A/B in one pane is the whole layout model, which is also what works on a phone.
 - Chan does not respawn a crashed extension. A crash means dead until Chan restarts.
 - `cs` must be on `PATH`, or named by `$MOBILE_CHAT_CS`.
