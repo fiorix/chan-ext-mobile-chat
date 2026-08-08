@@ -4,6 +4,10 @@ This file records notable development history and design decisions. Reference do
 
 ## 2026-08-08
 
+### v0.2.0
+
+Requires Chan v0.86.0 or newer. The agent is now spawned by `cs terminal new --command`, and every agent launches with its permission checks off, so a prompt the phone cannot answer never appears. Both are described below.
+
 ### The team of one is gone
 
 Chan v0.86.0 taught `cs terminal new` the `--command` and `--env` flags, which is the whole reason the team scaffolding existed. Spawning is now one call:

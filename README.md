@@ -26,7 +26,7 @@ curl -fsSL https://github.com/fiorix/chan-ext-mobile-chat/releases/latest/downlo
 
 The installer detects Linux x86_64 or arm64, macOS arm64, and Windows x86_64 under Git Bash. It verifies the archive against the release checksums before extracting anything, writes the executable under `~/.local/lib/mobile-chat`, and writes the declaration at `~/.chan/extensions/mobile-chat.toml` with an absolute command path.
 
-Pin a release with `curl -fsSL ... | MOBILE_CHAT_VERSION=v0.1.0 bash`, or override the roots with `MOBILE_CHAT_INSTALL_ROOT` and `CHAN_HOME`.
+Pin a release with `curl -fsSL ... | MOBILE_CHAT_VERSION=v0.2.0 bash`, or override the roots with `MOBILE_CHAT_INSTALL_ROOT` and `CHAN_HOME`.
 
 Then restart Chan, and "Mobile Chat" appears in the command launcher under Apps. If it does not, the declaration was rejected: check Chan's stderr for `extension ignored`.
 
