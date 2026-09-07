@@ -1,0 +1,32 @@
+[package]
+name = "whatsapp-bridge"
+description = "WhatsApp bridge for the Mobile Chat extension: pairing, logs, media, allowlist, routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# `simd` is left off: it gates `#![feature(portable_simd)]` and the workspace
+# pins a stable toolchain. Everything else in the default set is kept.
+whatsapp-rust = { version = "=0.7.0", default-features = false, features = [
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "tokio-native",
+    "ureq-client",
+    "signal",
+] }
+fast_qr = { version = "0.14", default-features = false, features = ["svg"] }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+anyhow = "1"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

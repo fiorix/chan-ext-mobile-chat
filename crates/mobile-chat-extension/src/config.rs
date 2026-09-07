@@ -55,6 +55,11 @@ pub struct Config {
 
     #[serde(default)]
     pub health: Health,
+
+    /// The WhatsApp bridge. Read once at startup; `enabled = false` (the
+    /// default) changes nothing until someone opts in.
+    #[serde(default)]
+    pub whatsapp: Whatsapp,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -103,6 +108,37 @@ pub struct Agent {
     pub prompt_argument: bool,
 }
 
+/// WhatsApp bridge configuration, the `[whatsapp]` section of
+/// `mobile-chat.toml`. Read once at startup, so changes here take effect when
+/// Chan restarts; everything a person changes from the phone lives in the
+/// bridge's own `settings.json` and reloads live instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Whatsapp {
+    /// Whether the bridge constructs at all. The default keeps an upgrade
+    /// inert: no directory, no lock file, no network.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Data root override. `None` means `<chan-home>/mobile-chat/whatsapp`.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Rotate a chat log when appending would take it past this size.
+    #[serde(default = "default_log_max_bytes")]
+    pub log_max_bytes: u64,
+    /// Rotated logs retained per chat; older ones drop off the end.
+    #[serde(default = "default_log_keep")]
+    pub log_keep: u32,
+    /// A single media file larger than this is not stored.
+    #[serde(default = "default_media_max_bytes")]
+    pub media_max_bytes: u64,
+    /// Media kinds stored when a chat is recorded.
+    #[serde(default = "default_media")]
+    pub media: Vec<String>,
+    /// Forward agent progress updates back to WhatsApp, not just replies.
+    #[serde(default = "default_reply_progress")]
+    pub reply_progress: bool,
+}
+
 fn default_agents() -> Vec<String> {
     DEFAULT_AGENTS
         .iter()
@@ -138,6 +174,42 @@ fn default_boot_timeout_secs() -> u64 {
     45
 }
 
+fn default_log_max_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_log_keep() -> u32 {
+    10
+}
+
+fn default_media_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_media() -> Vec<String> {
+    ["image", "video", "audio", "document", "sticker"]
+        .iter()
+        .map(|kind| (*kind).to_string())
+        .collect()
+}
+
+fn default_reply_progress() -> bool {
+    true
+}
+
+impl Default for Whatsapp {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: None,
+            log_max_bytes: default_log_max_bytes(),
+            log_keep: default_log_keep(),
+            media_max_bytes: default_media_max_bytes(),
+            media: default_media(),
+            reply_progress: default_reply_progress(),
+        }
+    }
+}
 fn default_poll_interval_secs() -> u64 {
     5
 }
@@ -162,6 +234,7 @@ impl Default for Config {
             agents: default_agents(),
             agent: BTreeMap::new(),
             health: Health::default(),
+            whatsapp: Whatsapp::default(),
         }
     }
 }
@@ -420,6 +493,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mobile-chat.toml");
         std::fs::write(&path, "agentz = [\"claude\"]\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn whatsapp_defaults_apply_when_the_section_is_absent() {
+        let (_dir, path) = write("agents = [\"claude\"]\n");
+        let whatsapp = Config::load(&path).unwrap().whatsapp;
+        assert!(!whatsapp.enabled);
+        assert_eq!(whatsapp.root, None);
+        assert_eq!(whatsapp.log_max_bytes, 1024 * 1024);
+        assert_eq!(whatsapp.log_keep, 10);
+        assert_eq!(whatsapp.media_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            whatsapp.media,
+            ["image", "video", "audio", "document", "sticker"]
+        );
+        assert!(whatsapp.reply_progress);
+    }
+
+    #[test]
+    fn a_full_whatsapp_section_parses() {
+        let (_dir, path) = write(
+            "agents = [\"claude\"]\n\
+             [whatsapp]\n\
+             enabled = true\n\
+             root = \"/tmp/wa\"\n\
+             log_max_bytes = 2048\n\
+             log_keep = 3\n\
+             media_max_bytes = 4096\n\
+             media = [\"image\", \"sticker\"]\n\
+             reply_progress = false\n",
+        );
+        let whatsapp = Config::load(&path).unwrap().whatsapp;
+        assert!(whatsapp.enabled);
+        assert_eq!(whatsapp.root, Some(PathBuf::from("/tmp/wa")));
+        assert_eq!(whatsapp.log_max_bytes, 2048);
+        assert_eq!(whatsapp.log_keep, 3);
+        assert_eq!(whatsapp.media_max_bytes, 4096);
+        assert_eq!(whatsapp.media, ["image", "sticker"]);
+        assert!(!whatsapp.reply_progress);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_whatsapp_section_is_rejected() {
+        let (_dir, path) = write(
+            "agents = [\"claude\"]\n\
+             [whatsapp]\n\
+             enabled = true\n\
+             pair_code = \"1234\"\n",
+        );
         assert!(Config::load(&path).is_err());
     }
 }
