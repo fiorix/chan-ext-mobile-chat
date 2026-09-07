@@ -1,0 +1,278 @@
+diff --git a/crates/chan-server/src/extensions.rs b/crates/chan-server/src/extensions.rs
+index b0896a37..7c39f186 100644
+--- a/crates/chan-server/src/extensions.rs
++++ b/crates/chan-server/src/extensions.rs
+@@ -45,6 +45,7 @@ const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+ #[derive(Clone)]
+ pub(crate) struct ExtensionTenantContext {
+     pub scope: String,
++    pub workspace: Option<String>,
+     pub shutdown_rx: watch::Receiver<bool>,
+ }
+ 
+diff --git a/crates/chan-server/src/lib.rs b/crates/chan-server/src/lib.rs
+index 548d040f..5c8d657f 100644
+--- a/crates/chan-server/src/lib.rs
++++ b/crates/chan-server/src/lib.rs
+@@ -1844,6 +1844,10 @@ fn router_with_extensions(
+ ) -> Router {
+     let extension_tenant = extensions::ExtensionTenantContext {
+         scope: state.instance_id.clone(),
++        workspace: state
++            .try_workspace()
++            .ok()
++            .map(|ws| ws.metadata_key().to_string()),
+         shutdown_rx: state.shutdown_rx.clone(),
+     };
+     // ---- Settings-write gate ----------------------------------------
+diff --git a/crates/chan-server/src/routes/extensions.rs b/crates/chan-server/src/routes/extensions.rs
+index a8adf95c..dfb1e714 100644
+--- a/crates/chan-server/src/routes/extensions.rs
++++ b/crates/chan-server/src/routes/extensions.rs
+@@ -21,6 +21,7 @@ use crate::extensions::{
+ 
+ const EXTENSION_FRAME_POLICY: &str = "frame-ancestors 'self'";
+ const EXTENSION_SCOPE_HEADER: &str = "x-chan-extension-scope";
++const EXTENSION_WORKSPACE_HEADER: &str = "x-chan-extension-workspace";
+ const EXTENSION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+ // Per-item idle bound on both proxied body directions. There is deliberately
+ // no total request deadline and no body size cap — long-lived streaming and
+@@ -144,6 +145,9 @@ async fn proxy_extension_request(
+             &id,
+             "request",
+         )));
++    if let Some(workspace) = &tenant.workspace {
++        outgoing = outgoing.header(EXTENSION_WORKSPACE_HEADER, workspace);
++    }
+     if had_origin {
+         outgoing = outgoing.header(header::ORIGIN, upstream.origin().ascii_serialization());
+     }
+@@ -200,6 +204,15 @@ async fn proxy_extension_websocket(
+         return (StatusCode::BAD_GATEWAY, "extension origin invalid").into_response();
+     };
+     headers.insert(HeaderName::from_static(EXTENSION_SCOPE_HEADER), scope);
++    if let Some(workspace) = &tenant.workspace {
++        let Ok(workspace) = HeaderValue::from_str(workspace) else {
++            return (StatusCode::BAD_GATEWAY, "extension workspace invalid").into_response();
++        };
++        headers.insert(
++            HeaderName::from_static(EXTENSION_WORKSPACE_HEADER),
++            workspace,
++        );
++    }
+     headers.insert(header::ORIGIN, origin);
+ 
+     let connection = tokio::time::timeout(
+@@ -626,6 +639,7 @@ mod tests {
+         (
+             ExtensionTenantContext {
+                 scope: "tenant-scope".to_string(),
++                workspace: Some("workspace-key".to_string()),
+                 shutdown_rx,
+             },
+             shutdown_tx,
+@@ -655,6 +669,13 @@ mod tests {
+         {
+             return (StatusCode::BAD_REQUEST, "scope missing").into_response();
+         }
++        if headers
++            .get(EXTENSION_WORKSPACE_HEADER)
++            .and_then(|value| value.to_str().ok())
++            != Some("workspace-key")
++        {
++            return (StatusCode::BAD_REQUEST, "workspace missing").into_response();
++        }
+         let origin = headers
+             .get(header::ORIGIN)
+             .and_then(|value| value.to_str().ok())
+@@ -679,6 +700,10 @@ mod tests {
+                 .get(EXTENSION_SCOPE_HEADER)
+                 .and_then(|value| value.to_str().ok())
+                 != Some("tenant-scope")
++            || headers
++                .get(EXTENSION_WORKSPACE_HEADER)
++                .and_then(|value| value.to_str().ok())
++                != Some("workspace-key")
+         {
+             return Err(StatusCode::UNAUTHORIZED);
+         }
+@@ -752,6 +777,8 @@ mod tests {
+             .header(header::ORIGIN, "null")
+             .header(header::COOKIE, "chan=secret")
+             .header(header::AUTHORIZATION, "Bearer whatever")
++            .header(EXTENSION_SCOPE_HEADER, "spoofed-scope")
++            .header(EXTENSION_WORKSPACE_HEADER, "spoofed-workspace")
+             .body(Body::empty())
+             .unwrap();
+         let response = app.oneshot(request).await.expect("proxy response");
+diff --git a/web/packages/workspace-app/src/components/CommandLauncher.test.ts b/web/packages/workspace-app/src/components/CommandLauncher.test.ts
+index 23e603aa..e2cf879a 100644
+--- a/web/packages/workspace-app/src/components/CommandLauncher.test.ts
++++ b/web/packages/workspace-app/src/components/CommandLauncher.test.ts
+@@ -266,6 +266,7 @@ function setActiveExtensionTab(): void {
+   const pane = resetLayout();
+   const tab: ExtensionTab = {
+     kind: "extension",
++    instanceId: "extension-instance",
+     id: "extension-test",
+     title: "Alpha app",
+     extensionId: "alpha",
+diff --git a/web/packages/workspace-app/src/components/ExtensionTab.svelte b/web/packages/workspace-app/src/components/ExtensionTab.svelte
+index 8e514c1c..ddd73c16 100644
+--- a/web/packages/workspace-app/src/components/ExtensionTab.svelte
++++ b/web/packages/workspace-app/src/components/ExtensionTab.svelte
+@@ -30,9 +30,11 @@
+   import { notify } from "../state/notify.svelte";
+   import { sessionState } from "../state/session.svelte";
+   import {
++    allTerminalTabs,
+     closeTab,
+     flipHybrid,
+     layout,
++    selectTabInPane,
+     type ExtensionTab,
+   } from "../state/tabs.svelte";
+   import { closeTabMenu, tabMenu } from "../state/tabMenu.svelte";
+@@ -102,6 +104,8 @@
+       {
+         type: EXTENSION_SESSION_CONTEXT_MESSAGE,
+         self_id: sessionWindowId(),
++        tab_id: tab.instanceId,
++        pane_id: paneId,
+         participants: sessionState.participants.map((participant) => ({
+           id: participant.window_id,
+           name: participant.name,
+@@ -143,6 +147,14 @@
+ 
+   function onFrameMessage(event: MessageEvent): void {
+     if (event.source !== frame?.contentWindow) return;
++    if (event.data?.type === "chan:extension-focus-terminal:v1") {
++      if (!extensionHasCapability(extension, "session-context")) return;
++      const target = event.data;
++      if (target.window_id !== sessionWindowId() || typeof target.pane_id !== "string") return;
++      if (!allTerminalTabs().some((terminal) => terminal.id === target.tab_id)) return;
++      selectTabInPane(target.pane_id, target.tab_id);
++      return;
++    }
+     if (event.data?.type === EXTENSION_READY_MESSAGE) {
+       markExtensionFrameReady(tab.id);
+       postHostKeys();
+diff --git a/web/packages/workspace-app/src/state/paneModeConflict.test.ts b/web/packages/workspace-app/src/state/paneModeConflict.test.ts
+index 7c58dd81..bb2678cc 100644
+--- a/web/packages/workspace-app/src/state/paneModeConflict.test.ts
++++ b/web/packages/workspace-app/src/state/paneModeConflict.test.ts
+@@ -326,6 +326,7 @@ const allCurrentTabFields = {
+   ds: true,
+   ar: true,
+   xi: true,
++  xe: true,
+ } satisfies Record<keyof SerTab, true>;
+ 
+ const representativeTabs = {
+@@ -389,7 +390,7 @@ const representativeTabs = {
+     iw: 240,
+   } as SerTab,
+   d: { k: "d", a: 1, cs: 1, ds: [1], ar: true } as SerTab,
+-  x: { k: "x", a: 1, xi: "calendar", n: "Calendar" } as SerTab,
++  x: { k: "x", a: 1, xi: "calendar", xe: "calendar-instance", n: "Calendar" } as SerTab,
+ } satisfies Record<TabKind, SerTab>;
+ 
+ const representativeLayout = {
+diff --git a/web/packages/workspace-app/src/state/tabs.svelte.ts b/web/packages/workspace-app/src/state/tabs.svelte.ts
+index a4bd1cd3..79287a25 100644
+--- a/web/packages/workspace-app/src/state/tabs.svelte.ts
++++ b/web/packages/workspace-app/src/state/tabs.svelte.ts
+@@ -598,6 +598,7 @@ export type ExtensionTab = {
+   id: string;
+   title: string;
+   extensionId: string;
++  instanceId: string;
+ };
+ 
+ /// Carousel slot count, shared by the on/off helpers below and the
+@@ -3707,6 +3708,7 @@ function cloneTab(src: Tab): Tab {
+       id: src.id,
+       title: src.title,
+       extensionId: src.extensionId,
++      instanceId: src.instanceId,
+     };
+   }
+   return {
+@@ -4397,6 +4399,7 @@ export function openExtensionInPane(
+     id: id("extension"),
+     title: title.trim() || extensionId,
+     extensionId,
++    instanceId: crypto.randomUUID(),
+   };
+   mutablePaneTabs(node, targetSide).push(tab);
+   setPaneActiveTabId(node, tab.id, targetSide);
+@@ -5549,6 +5552,8 @@ export type SerTab = {
+   /// Stable extension id. The authenticated entry URL is intentionally never
+   /// serialized; it is resolved from the process-local catalog after restore.
+   xi?: string;
++  /// Persistent extension instance, independent of ephemeral layout tab ids.
++  xe?: string;
+ };
+ export type SerFocusColor = "o" | "g" | "p";
+ export type SerHybridTheme = "d" | "l";
+@@ -5618,7 +5623,7 @@ export const paneModeConflictFieldSets = {
+       excluded: ["bi", "bs", "bd", "be", "bsc", "iw"],
+     },
+     d: { included: ["k", "a"], excluded: ["cs", "ds", "ar"] },
+-    x: { included: ["k", "a", "xi"], excluded: ["n"] },
++    x: { included: ["k", "a", "xi", "xe"], excluded: ["n"] },
+   },
+ } as const;
+ 
+@@ -5646,6 +5651,7 @@ function paneModeIncludedTabFieldEqual(
+   if (field === "xi") {
+     return (baseline.xi?.trim() ?? "") === (incoming.xi?.trim() ?? "");
+   }
++  if (field === "xe") return baseline.xe === incoming.xe;
+   if (field === "n" && kind === "t") {
+     return (
+       (baseline.n?.trim() || "Terminal") ===
+@@ -6049,6 +6055,7 @@ function serializeTab(
+     return {
+       k: "x",
+       xi: t.extensionId,
++      xe: t.instanceId,
+       n: t.title,
+       ...active,
+     };
+@@ -6310,6 +6317,9 @@ function restoreExtensionTabFromSer(sertab: SerTab): ExtensionTab | null {
+     id: id("extension"),
+     title: sertab.n?.trim() || extensionId,
+     extensionId,
++    instanceId: typeof sertab.xe === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(sertab.xe)
++      ? sertab.xe
++      : crypto.randomUUID(),
+   };
+ }
+ 
+diff --git a/web/packages/workspace-app/src/state/tabs.test.ts b/web/packages/workspace-app/src/state/tabs.test.ts
+index bf0213dd..91e7a6f0 100644
+--- a/web/packages/workspace-app/src/state/tabs.test.ts
++++ b/web/packages/workspace-app/src/state/tabs.test.ts
+@@ -1415,8 +1415,20 @@ describe("pane state", () => {
+       throw new Error("expected extension tab after restore");
+     }
+     expect(restored.extensionId).toBe("echo");
++    expect(restored.instanceId).toBe(opened?.instanceId);
++    expect(openExtensionInActivePane("echo", "Another")?.instanceId).not.toBe(restored.instanceId);
+     expect(restored.title).toBe("Echo test");
+-    expect(activePane().activeTabId).toBe(restored.id);
++  });
++
++  test("moving an extension tab retains its conversation identity", () => {
++    resetLayout([]);
++    const opened = openExtensionInActivePane("echo", "Echo test")!;
++    const pane = activePane();
++    moveTab(pane.id, opened.id, pane.id, 0, { fromSide: "a", toSide: "b" });
++    const moved = paneTabs(pane, "b")[0];
++    expect(moved?.kind).toBe("extension");
++    if (moved?.kind !== "extension") throw new Error("expected extension");
++    expect(moved.instanceId).toBe(opened.instanceId);
+   });
+ 
+   test("hash round-trips a Dashboard tab's carousel slide cursor", async () => {

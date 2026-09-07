@@ -2,52 +2,100 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
     <title>Mobile Chat</title>
     <link rel="stylesheet" href="app.css" />
   </head>
   <body>
     <main id="app">
-      <header id="strip" class="strip">
-        <span id="dot" class="dot"></span>
-        <span id="headline">Connecting</span>
-        <button id="peek" type="button" class="ghost" hidden>Peek</button>
+      <header class="header">
+        <button
+          id="home"
+          class="icon-button"
+          type="button"
+          aria-label="Conversations"
+          title="Conversations"
+        >
+          &#9776;
+        </button>
+        <div class="heading">
+          <h1 id="title">Mobile Chat</h1>
+          <p id="status" role="status">Connecting...</p>
+        </div>
+        <button id="peek" type="button" hidden>Peek</button>
+        <details id="actions" hidden>
+          <summary aria-label="Conversation actions">&#8943;</summary>
+          <div class="menu">
+            <button id="stop" type="button" class="danger">Stop agent</button>
+          </div>
+        </details>
       </header>
-
-      <p id="detail" class="detail" hidden></p>
-
-      <section id="picker" class="picker" hidden>
-        <label for="agent">Agent</label>
-        <div class="row">
-          <select id="agent"></select>
-          <button id="start" type="button" class="primary">Start</button>
+      <p id="notice" class="notice" role="status" hidden></p>
+      <section id="welcome" class="welcome">
+        <h2>New conversation</h2>
+        <form id="create-form">
+          <label for="agent">Agent</label>
+          <select id="agent" required></select>
+          <label for="first-message">What would you like to work on?</label>
+          <textarea
+            id="first-message"
+            rows="4"
+            placeholder="Describe a task or ask a question"
+            required
+          ></textarea>
+          <button id="create" class="primary" type="submit" disabled>
+            Start conversation
+          </button>
+        </form>
+        <p id="restore-note" class="muted" hidden>
+          Your conversations are saved. Reopen one below after reloading Chan.
+        </p>
+        <section aria-labelledby="recent-title">
+          <h2 id="recent-title">Saved conversations</h2>
+          <div id="recent"></div>
+        </section>
+        <div id="load-errors" class="notice" hidden></div>
+      </section>
+      <section id="chat" class="chat" hidden>
+        <p id="detail" class="detail" hidden></p>
+        <button id="connect-agent" type="button" class="connect-agent" hidden>
+          Connect chat
+        </button>
+        <div
+          id="transcript"
+          class="transcript"
+          tabindex="0"
+          aria-label="Conversation messages"
+        >
+          <button id="older" type="button" class="older" hidden>
+            Load earlier messages
+          </button>
+          <div id="messages"></div>
         </div>
-      </section>
-
-      <section id="recovery" class="recovery" hidden>
-        <button id="nudge" type="button" class="ghost">Nudge</button>
-        <button id="escape" type="button" class="ghost">Escape</button>
-        <button id="restart" type="button" class="ghost">Restart</button>
-        <button id="close" type="button" class="danger">Close</button>
-      </section>
-
-      <div class="spacer"></div>
-
-      <section id="composer" class="composer" hidden>
-        <textarea
-          id="text"
-          rows="3"
-          placeholder="Message the agent"
-          autocomplete="off"
-          autocapitalize="sentences"
-        ></textarea>
-        <div class="row">
-          <span id="count" class="count"></span>
-          <button id="send" type="button" class="primary">Send</button>
+        <button id="latest" class="latest" type="button" hidden>
+          New messages &#8595;
+        </button>
+        <div id="ended" class="ended" hidden>
+          <span>Conversation saved.</span
+          ><button id="another" type="button">New conversation</button>
         </div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="text">Message the agent</label>
+          <textarea
+            id="text"
+            rows="2"
+            placeholder="Message the agent"
+            autocomplete="off"
+          ></textarea>
+          <div class="composer-footer">
+            <span id="saved" class="muted" role="status"></span
+            ><button id="send" class="primary" type="submit">Send</button>
+          </div>
+        </form>
       </section>
-
-      <p id="notice" class="notice" hidden></p>
     </main>
     <script type="module" src="app.js"></script>
   </body>

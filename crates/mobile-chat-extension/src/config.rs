@@ -1,4 +1,4 @@
-//! User configuration for the agent roster and the babysitter timings.
+//! User configuration for the agent roster and health polling.
 //!
 //! The file lives at `<chan-home>/mobile-chat.toml`, deliberately outside
 //! `<chan-home>/extensions/`: Chan parses every `.toml` in that directory as an
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The agents Chan knows a submit chord for (`SubmitAgent` in chan-shell),
 /// each paired with the flag that starts it without a permission gate.
@@ -19,7 +19,7 @@ use serde::Deserialize;
 /// difference between a message being answered and a message being ignored.
 ///
 /// The flag answers the other half of the same problem. This extension's only
-/// reply channel is `cs terminal survey`; an agent that stops at its own
+/// reply channel is the Mobile Chat helper; an agent that stops at its own
 /// permission prompt never reaches it, and that prompt lives in a terminal
 /// nobody is looking at, so the session just goes quiet. `claude` gets
 /// `--permission-mode bypassPermissions` rather than
@@ -32,6 +32,9 @@ const KNOWN_AGENTS: &[(&str, &str)] = &[
     ("gemini", "--yolo"),
     ("opencode", "--auto"),
 ];
+
+/// Agents offered when the config file names none.
+const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "kimi"];
 
 /// Cap on the config file, so a stray large file cannot be slurped whole.
 const CONFIG_LIMIT_BYTES: u64 = 64 * 1024;
@@ -57,14 +60,17 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOverride {
+    /// Append the chat brief as a positional CLI prompt. Defaults to true for
+    /// Claude and Codex on Unix; other commands use explicit Connect chat.
+    pub prompt_argument: Option<bool>,
     /// Command the terminal spawns, free-form: Chan runs it through a shell,
     /// so `my-shell-script --flag` works as written. That shell does not read
     /// your login files, so an agent your shell rc puts on PATH needs an
     /// absolute path here.
     ///
     /// Defaults to the roster name plus that agent's permission-bypass flag.
-    /// Naming a command replaces both halves, so carry the flag yourself or
-    /// the agent will stop at a prompt nobody can see.
+    /// Naming a command replaces both halves. Without the flag, native
+    /// permission prompts remain available through Peek.
     pub command: Option<String>,
     /// Which submit chord to send. Becomes `CHAN_AGENT`, which is what pins
     /// Chan's chord selection when the command does not name a known agent.
@@ -76,30 +82,31 @@ pub struct AgentOverride {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
-    /// How long a spawned agent has to appear in `cs terminal list` and then
-    /// come ready for input. Both are the same deadline, counted from spawn.
+    /// How long to wait for a spawned agent to appear in `cs terminal list`.
     #[serde(default = "default_boot_timeout_secs")]
     pub boot_timeout_secs: u64,
     /// Interval between health polls.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    /// How long a non-draining queue plus unchanged output means "stalled".
+    /// How long a queued message waits before suggesting Peek.
     #[serde(default = "default_stall_after_secs")]
     pub stall_after_secs: u64,
 }
 
 /// One roster entry with its overrides already applied and validated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
     pub command: String,
     pub submit_chord: String,
+    #[serde(default)]
+    pub prompt_argument: bool,
 }
 
 fn default_agents() -> Vec<String> {
-    KNOWN_AGENTS
+    DEFAULT_AGENTS
         .iter()
-        .map(|(name, _)| name.to_string())
+        .map(|name| (*name).to_string())
         .collect()
 }
 
@@ -239,6 +246,9 @@ impl Config {
                     name: name.to_string(),
                     command,
                     submit_chord: submit_chord.to_string(),
+                    prompt_argument: over
+                        .and_then(|o| o.prompt_argument)
+                        .unwrap_or(cfg!(unix) && matches!(submit_chord, "claude" | "codex")),
                 })
             })
             .collect()
@@ -256,7 +266,7 @@ pub fn default_config_path() -> PathBuf {
     chan_home().join("mobile-chat.toml")
 }
 
-fn chan_home() -> PathBuf {
+pub(crate) fn chan_home() -> PathBuf {
     match std::env::var("CHAN_HOME") {
         Ok(home) if !home.trim().is_empty() => PathBuf::from(home),
         _ => match std::env::var("HOME") {
@@ -271,11 +281,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absent_file_yields_the_five_default_agents() {
+    fn absent_file_yields_the_supported_default_agents() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&dir.path().join("nope.toml")).unwrap();
         let names: Vec<_> = config.roster().into_iter().map(|a| a.name).collect();
-        assert_eq!(names, ["claude", "codex", "kimi", "gemini", "opencode"]);
+        assert_eq!(names, ["claude", "codex", "kimi"]);
     }
 
     #[test]

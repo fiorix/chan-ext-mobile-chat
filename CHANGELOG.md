@@ -2,6 +2,16 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## 2026-09-07
+
+### Persistent conversations
+
+Replace the team-and-survey prototype with independent conversations and directly spawned Claude, Codex, and Kimi terminals. Add a conversation-bound helper for readiness, reads, Markdown replies, progress, and asynchronous inline questions. Retain history, drafts, partial answers, reading position, and request receipts using private atomic snapshots.
+
+Deliver short message references through the terminal queue, one per completed agent turn. Keep ambiguous delivery visible without replaying it. Closing a chat detaches; stopping its agent retains history and deactivates pending questions. Add a companion Chan patch for persistent tab/workspace identity and exact Peek selection.
+
+Real CLI testing exposed two integration mistakes: startup text could reach native trust dialogs before the agent input was ready, and `cs terminal close` does not accept `--force`. Claude and Codex now receive an initial prompt argument; Kimi uses explicit **Connect chat** after startup. Preserve the v0.2.0 default permission flags and route the brief's approval gate through inline questions. Custom commands retain control of their flags.
+
 ## 2026-08-08
 
 ### v0.2.0

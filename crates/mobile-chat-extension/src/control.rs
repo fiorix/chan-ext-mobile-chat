@@ -1,24 +1,10 @@
-//! Driving Chan through the `cs` client.
-//!
-//! Chan spawns extensions with no environment of its own
-//! (`chan-server::extensions::start_extension` sets none), so `$CHAN_CONTROL_SOCKET`
-//! is not inherited. We rediscover it the way `chan ps` does: the extension's
-//! parent process IS the serving `chan-server`, and its control sockets are named
-//! `chan-control-<pid>-<rand>.sock` in a small set of runtime directories.
-//!
-//! One pid can own several sockets (one per served tenant), and stale sockets
-//! from dead processes linger, so the pid is a filter and not an answer. The
-//! socket is settled per window by probing candidates with a window-scoped
-//! `cs pane list --window <id>`: the socket whose server knows our window is
-//! ours by construction, and a dead socket fails the connect immediately.
-//!
-//! Every operation shells out to `cs` rather than re-implementing the control
-//! wire, so the CLI's semantics and typed exit codes are the contract.
+//! Window-scoped Chan operations through the installed `cs` client.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
@@ -83,13 +69,12 @@ impl Cs {
         }
     }
 
+    #[cfg(test)]
+    pub async fn set_test_socket(&self, window: &str, socket: PathBuf) {
+        self.sockets.lock().await.insert(window.into(), socket);
+    }
+
     /// Run `cs` against the control socket serving `window_id`.
-    ///
-    /// `CHAN_WORKSPACE_PATH` is deliberately NOT set: `cs terminal team`
-    /// anchors a relative team dir to the caller's cwd only when that variable
-    /// is present, and passes it through as workspace-relative otherwise. We
-    /// want the pass-through, because the extension's cwd
-    /// (`~/.chan/extensions`) is nowhere near the workspace.
     pub async fn run<I, S>(&self, window_id: &str, args: I) -> Result<CsOutput>
     where
         I: IntoIterator<Item = S>,
@@ -111,21 +96,71 @@ impl Cs {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = tokio::process::Command::new(&self.binary)
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
             .args(args)
             .env("CHAN_CONTROL_SOCKET", socket)
             .env("CHAN_WINDOW_ID", window_id)
             .env_remove("CHAN_WORKSPACE_PATH")
             .env_remove("CHAN_TAB_NAME")
             .env_remove("CHAN_TAB_GROUP")
-            .output()
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
             .await
+            .context("cs did not acknowledge the operation within 15 seconds")?
             .with_context(|| format!("running {}", self.binary.display()))?;
         Ok(CsOutput {
             code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    pub(crate) async fn write(
+        &self,
+        window: &str,
+        handle: &str,
+        chord: &str,
+        text: &str,
+    ) -> Result<()> {
+        if text.len() > 4096 {
+            anyhow::bail!("Internal prompt exceeds Chan's 4096-byte write limit.");
+        }
+        let out = self
+            .run(
+                window,
+                [
+                    "terminal",
+                    "write",
+                    "--tab-name",
+                    handle,
+                    &format!("--submit={chord}"),
+                    text,
+                ],
+            )
+            .await?;
+        if out.code == EXIT_SUBMIT_REFUSED || !out.ok() {
+            anyhow::bail!("{}", out.message());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn pane(&self, window: &str, requested: Option<&str>) -> Result<String> {
+        let out = self.run(window, ["pane", "list", "--json"]).await?;
+        if !out.ok() {
+            anyhow::bail!("{}", out.message());
+        }
+        let layout: serde_json::Value = serde_json::from_str(&out.stdout)?;
+        let target = requested
+            .or_else(|| layout["activePaneId"].as_str())
+            .context("Chan did not identify an active pane")?;
+        if !layout["panes"]
+            .as_array()
+            .is_some_and(|panes| panes.iter().any(|pane| pane["id"] == target))
+        {
+            anyhow::bail!("This chat's pane is no longer available.");
+        }
+        Ok(target.to_string())
     }
 
     /// Settle (and cache) the control socket that serves `window_id`.

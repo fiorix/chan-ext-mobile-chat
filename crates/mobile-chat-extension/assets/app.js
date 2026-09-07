@@ -1,42 +1,93 @@
-// Mobile Chat UI.
-//
-// This runs in an opaque-origin sandbox: no same-origin access to Chan, no
-// storage, and every postMessage needs a "*" target origin. The source check on
-// every inbound message is what "*" costs us, so it is not optional.
-
+// Opaque-origin iframe. Durable data belongs to the extension server.
 const HOST_READY = "chan:extension-ready:v1";
-const HOST_COMMAND = "chan:extension-command:v1";
-const HOST_RESULT = "chan:extension-command-result:v1";
 const HOST_SESSION = "chan:extension-session-context:v1";
-const HOST_VIEW = "chan:extension-view-state:v1";
-
-// `cs terminal write` refuses anything larger, so refuse it here where we can
-// say something useful about it.
-const MAX_WRITE_BYTES = 4096;
-
+const MAX_BODY = 64 * 1024;
+const el = (id) => document.getElementById(id);
+const ui = Object.fromEntries(
+  [
+    "title",
+    "status",
+    "home",
+    "peek",
+    "actions",
+    "stop",
+    "notice",
+    "welcome",
+    "agent",
+    "first-message",
+    "create",
+    "create-form",
+    "recent",
+    "restore-note",
+    "load-errors",
+    "chat",
+    "detail",
+    "connect-agent",
+    "transcript",
+    "messages",
+    "older",
+    "latest",
+    "ended",
+    "another",
+    "composer",
+    "text",
+    "send",
+    "saved",
+  ].map((id) => [id, el(id)]),
+);
 const state = {
   socket: null,
-  windowId: null,
-  status: null,
-  hostReady: false,
+  connected: false,
+  context: null,
+  active: null,
+  home: true,
+  snapshot: null,
+  conversation: null,
+  entries: new Map(),
+  pending: new Map(),
+  view: { draft: "", answers: {}, anchor: null, offset: 0, at_bottom: true },
+  viewRevision: 0,
+  dirty: false,
+  saving: false,
+  saveTimer: null,
+  restoring: false,
+  hasMore: false,
+  loading: false,
+  busy: new Set(),
+  retryDelay: 500,
 };
+const phases = {
+  starting: "Starting agent",
+  connecting: "Connecting agent",
+  ready: "Ready",
+  working: "Working",
+  waiting: "Waiting for you",
+  stopping: "Stopping agent",
+  stopped: "Agent stopped",
+  failed: "Could not start agent",
+};
+const ended = (phase) => phase === "stopped" || phase === "failed";
+const bytes = (text) => new TextEncoder().encode(text).length;
+const id = () =>
+  Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
 
-const el = (id) => document.getElementById(id);
-const ui = {
-  dot: el("dot"),
-  headline: el("headline"),
-  detail: el("detail"),
-  picker: el("picker"),
-  agent: el("agent"),
-  start: el("start"),
-  peek: el("peek"),
-  recovery: el("recovery"),
-  composer: el("composer"),
-  text: el("text"),
-  count: el("count"),
-  send: el("send"),
-  notice: el("notice"),
-};
+function notice(message = "") {
+  ui.notice.textContent = message;
+  ui.notice.hidden = !message;
+}
+function request(op, args = {}) {
+  if (!state.connected)
+    return Promise.reject(
+      new Error("Connection lost. Your text is kept here until you reconnect."),
+    );
+  const payload = { id: id(), op, ...args };
+  return new Promise((resolve, reject) => {
+    state.pending.set(payload.id, { payload, resolve, reject });
+    state.socket.send(JSON.stringify(payload));
+  });
+}
 
 function controlUrl() {
   const url = new URL("control", window.location.href);
@@ -47,171 +98,644 @@ function controlUrl() {
 function connect() {
   const socket = new WebSocket(controlUrl());
   state.socket = socket;
-  socket.addEventListener("open", () => {
-    if (state.windowId) send({ op: "hello", window_id: state.windowId });
+  socket.addEventListener("open", async () => {
+    if (state.socket !== socket) return;
+    state.connected = true;
+    state.retryDelay = 500;
+    renderHeader();
+    const retries = [...state.pending.values()];
+    try {
+      await hello();
+      for (const pending of retries) {
+        if (state.pending.has(pending.payload.id))
+          socket.send(JSON.stringify(pending.payload));
+      }
+      if (state.dirty && !state.saving) scheduleSave();
+    } catch (error) {
+      notice(error.message);
+    }
   });
-  socket.addEventListener("message", (event) => {
+  socket.addEventListener("message", ({ data }) => {
+    if (state.socket !== socket) return;
     let message;
     try {
-      message = JSON.parse(event.data);
+      message = JSON.parse(data);
     } catch {
       return;
     }
-    if (message.type === "status") {
-      state.status = message;
-      render();
-    } else if (message.type === "notice") {
-      showNotice(message);
+    if (message.type === "snapshot") applySnapshot(message);
+    else if (message.type === "result") {
+      const pending = state.pending.get(message.id);
+      if (!pending) {
+        if (!message.ok) notice(message.error);
+        return;
+      }
+      state.pending.delete(message.id);
+      if (message.ok) pending.resolve(message.result);
+      else pending.reject(new Error(message.error));
     }
   });
   socket.addEventListener("close", () => {
-    state.socket = null;
-    setTimeout(connect, 1500);
+    if (state.socket !== socket) return;
+    state.connected = false;
+    for (const [key, pending] of state.pending) {
+      if (["hello", "peek", "history"].includes(pending.payload.op)) {
+        state.pending.delete(key);
+        pending.reject(
+          new Error("Connection lost. Please try again after reconnecting."),
+        );
+      }
+    }
+    renderHeader();
+    setTimeout(connect, state.retryDelay);
+    state.retryDelay = Math.min(state.retryDelay * 2, 8000);
   });
 }
 
-function send(payload) {
-  if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-    state.socket.send(JSON.stringify(payload));
-    return true;
+async function hello() {
+  if (!state.context) return;
+  const result = await request("hello", state.context);
+  let restore = state.active;
+  // window.name survives iframe reload; a restored Chan window needs host identity.
+  if (!restore && !result.conversation_id) {
+    const match = /^mobile-chat:([a-zA-Z0-9_-]+)$/.exec(window.name);
+    if (match) restore = match[1];
   }
-  showNotice({ ok: false, message: "not connected to the extension" });
-  return false;
+  if (restore && restore !== result.conversation_id)
+    await request("attach", { conversation_id: restore });
 }
 
-function showNotice({ ok, message }) {
-  if (!message) {
-    ui.notice.hidden = true;
-    return;
-  }
-  ui.notice.hidden = false;
-  ui.notice.textContent = message;
-  ui.notice.dataset.ok = String(ok !== false);
-}
-
-const HEADLINES = {
-  idle: () => "Pick an agent",
-  spawning: (s) => `Starting ${s.agent}`,
-  booting: (s) => `${s.agent} is booting`,
-  live: (s) => `${s.handle} · ${s.agent}`,
-  stalled: (s) => `${s.handle} is stuck`,
-  dead: (s) => `${s.agent} exited`,
-  failed: (s) => `${s.agent || "agent"} failed to start`,
-};
-
-function render() {
-  const status = state.status;
-  if (!status) return;
-
-  const phase = status.phase;
-  ui.dot.dataset.phase = phase;
-  ui.headline.textContent = (HEADLINES[phase] || (() => phase))(status);
-
-  const bits = [];
-  if (status.detail) bits.push(status.detail);
-  if (phase === "live" || phase === "stalled") {
-    bits.push(`queue ${status.queue_depth}`, `quiet ${status.idle_secs}s`);
-  }
-  ui.detail.hidden = bits.length === 0;
-  ui.detail.textContent = bits.join(" · ");
-
-  const running = phase === "live" || phase === "stalled" || phase === "booting";
-  const finished = phase === "idle" || phase === "dead" || phase === "failed";
-
-  ui.picker.hidden = !finished;
-  ui.composer.hidden = !running;
-  ui.peek.hidden = !running;
-  ui.recovery.hidden = !(phase === "stalled" || phase === "dead" || phase === "live");
-  ui.send.disabled = phase !== "live" && phase !== "stalled";
-
-  if (ui.agent.options.length !== (status.agents || []).length) {
+function applySnapshot(snapshot) {
+  state.snapshot = snapshot;
+  const selectedAgent = ui.agent.value;
+  if (ui.agent.dataset.roster !== JSON.stringify(snapshot.agents)) {
     ui.agent.replaceChildren(
-      ...(status.agents || []).map((name) => {
+      ...snapshot.agents.map((agent) => {
         const option = document.createElement("option");
-        option.value = name;
-        option.textContent = name;
+        option.value = agent;
+        option.textContent = agent;
         return option;
       }),
     );
+    if (snapshot.agents.includes(selectedAgent)) ui.agent.value = selectedAgent;
+    ui.agent.dataset.roster = JSON.stringify(snapshot.agents);
   }
-  updateCount();
+  renderRecent(snapshot.conversations);
+  ui["restore-note"].hidden =
+    snapshot.persistent_host && !!state.context?.tab_id;
+  ui["load-errors"].hidden = snapshot.errors.length === 0;
+  ui["load-errors"].textContent = snapshot.errors.join("\n");
+  const conversation = snapshot.conversation;
+  if (conversation) {
+    const changed = state.active !== conversation.id;
+    if (
+      !changed &&
+      state.conversation &&
+      conversation.revision < state.conversation.revision
+    )
+      return;
+    const oldCount = state.entries.size;
+    const position = changed
+      ? conversation.view
+      : state.home
+        ? state.view
+        : capturePosition();
+    if (changed) {
+      clearTimeout(state.saveTimer);
+      state.active = conversation.id;
+      window.name = `mobile-chat:${conversation.id}`;
+      state.home = false;
+      state.entries.clear();
+      ui.messages.replaceChildren();
+      state.dirty = false;
+      state.view = structuredClone(conversation.view);
+      state.viewRevision = conversation.view_revision;
+      state.hasMore = conversation.has_more;
+      ui.text.value = state.view.draft;
+    } else if (
+      !state.dirty &&
+      !state.saving &&
+      conversation.view_revision >= state.viewRevision
+    ) {
+      state.view = structuredClone(conversation.view);
+      ui.text.value = state.view.draft;
+    }
+    state.viewRevision = Math.max(
+      state.viewRevision,
+      conversation.view_revision,
+    );
+    state.conversation = conversation;
+    for (const entry of conversation.entries)
+      state.entries.set(entry.id, entry);
+    for (const [key, question] of Object.entries(
+      conversation.question_states,
+    )) {
+      if (state.entries.has(key)) state.entries.get(key).question = question;
+    }
+    renderEntries();
+    if (changed) restorePosition(position);
+    else applyPosition(position);
+    if (!position.at_bottom && state.entries.size > oldCount)
+      ui.latest.hidden = false;
+  }
+  renderHeader();
 }
 
-function updateCount() {
-  const bytes = new TextEncoder().encode(ui.text.value).length;
-  const over = bytes > MAX_WRITE_BYTES;
-  ui.count.textContent = bytes === 0 ? "" : `${bytes} / ${MAX_WRITE_BYTES} bytes`;
-  ui.count.dataset.over = String(over);
-  if (over) ui.send.disabled = true;
+function renderHeader() {
+  const conversation = state.conversation;
+  const showChat = conversation && !state.home;
+  ui.welcome.hidden = !!showChat;
+  ui.chat.hidden = !showChat;
+  ui.title.textContent = showChat ? conversation.title : "Mobile Chat";
+  ui.status.textContent = !state.connected
+    ? "Reconnecting..."
+    : showChat
+      ? `${conversation.agent} · ${phases[conversation.phase] || conversation.phase}`
+      : "Your agents, one conversation at a time";
+  ui.peek.hidden = !showChat || ended(conversation?.phase);
+  ui.peek.disabled = !state.connected;
+  ui.actions.hidden = !showChat || ended(conversation?.phase);
+  ui.stop.disabled = !state.connected || state.busy.has("stop");
+  ui.create.disabled =
+    !state.connected || !state.context || state.busy.has("create");
+  if (showChat) {
+    ui.detail.textContent = conversation.detail;
+    ui.detail.hidden = !conversation.detail;
+    ui["connect-agent"].hidden = !conversation.can_connect;
+    ui["connect-agent"].disabled =
+      !state.connected || state.busy.has("connect-agent");
+    ui.composer.hidden = ended(conversation.phase);
+    ui.ended.hidden = !ended(conversation.phase);
+    ui.send.disabled =
+      !state.connected ||
+      state.busy.has("send") ||
+      conversation.phase === "stopping";
+    for (const entry of state.entries.values()) {
+      if (entry.question)
+        updateQuestion(document.getElementById(`message-${entry.id}`), entry);
+    }
+  }
+  renderSaved();
 }
 
-function sendMessage() {
+function renderSaved() {
+  ui.saved.textContent = !state.connected
+    ? "Offline · changes not yet saved"
+    : state.dirty || state.saving
+      ? "Saving..."
+      : state.active
+        ? "Saved"
+        : "";
+}
+
+function renderRecent(conversations) {
+  const encoded = JSON.stringify(conversations);
+  if (ui.recent.dataset.contents === encoded) return;
+  ui.recent.dataset.contents = encoded;
+  ui.recent.replaceChildren();
+  if (!conversations.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "Your conversations will appear here.";
+    ui.recent.append(empty);
+  }
+  for (const conversation of conversations) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recent-item";
+    const title = document.createElement("strong");
+    title.textContent = conversation.title;
+    const subtitle = document.createElement("small");
+    subtitle.textContent = `${conversation.agent} · ${phases[conversation.phase]}${conversation.pending_questions ? ` · ${conversation.pending_questions} waiting` : ""}`;
+    button.append(title, subtitle);
+    button.addEventListener("click", () => attach(conversation.id));
+    ui.recent.append(button);
+  }
+}
+
+async function attach(conversationId) {
+  try {
+    await flushView();
+    await request("attach", { conversation_id: conversationId });
+    state.home = false;
+    notice();
+    renderHeader();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+function renderEntries() {
+  let cursor = ui.messages.firstElementChild;
+  for (const entry of state.entries.values()) {
+    let node = document.getElementById(`message-${entry.id}`);
+    if (!node) {
+      node = document.createElement("article");
+      node.id = `message-${entry.id}`;
+      node.className = "entry";
+      node.dataset.id = entry.id;
+      node.dataset.role = entry.role;
+      node.dataset.kind = entry.kind;
+      const header = document.createElement("div");
+      header.className = "entry-header";
+      header.textContent =
+        entry.role === "user" ? "You" : state.conversation.agent;
+      const body = document.createElement("div");
+      body.className = "message-body";
+      // HTML is generated by the server's restricted Markdown renderer.
+      body.innerHTML = entry.html;
+      for (const link of body.querySelectorAll("a")) {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+      const delivery = document.createElement("p");
+      delivery.className = "delivery";
+      node.append(header, body, delivery);
+      if (entry.question) addQuestion(node, entry);
+    }
+    const delivery = node.querySelector(".delivery");
+    const labels = {
+      saved: "Waiting to send",
+      sending: "Sending",
+      queued: "Queued",
+      read: "Read by agent",
+      uncertain: "Delivery uncertain",
+      failed: "Not delivered",
+    };
+    delivery.textContent = [labels[entry.delivery], entry.detail]
+      .filter(Boolean)
+      .join(" · ");
+    delivery.dataset.state = entry.delivery || "";
+    delivery.hidden = !delivery.textContent;
+    if (entry.question) updateQuestion(node, entry);
+    if (node !== cursor) ui.messages.insertBefore(node, cursor);
+    cursor = node.nextElementSibling;
+  }
+  ui.older.hidden = !state.hasMore;
+  ui.older.disabled = state.loading;
+}
+
+function addQuestion(node, entry) {
+  const form = document.createElement("form");
+  form.className = "question-form";
+  const options = document.createElement("div");
+  options.className = "question-options";
+  const label = document.createElement("label");
+  label.htmlFor = `answer-${entry.id}`;
+  label.textContent = "Your answer";
+  const input = document.createElement("textarea");
+  input.id = label.htmlFor;
+  input.rows = 2;
+  input.placeholder = "Choose above or write your answer";
+  input.value = state.view.answers[entry.id] || "";
+  for (const option of entry.question.options) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = option;
+    button.addEventListener("click", () => {
+      input.value = option;
+      editAnswer(entry.id, input.value);
+      updateQuestion(node, state.entries.get(entry.id));
+    });
+    options.append(button);
+  }
+  input.addEventListener("input", () => editAnswer(entry.id, input.value));
+  const footer = document.createElement("div");
+  footer.className = "question-footer";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel question";
+  cancel.addEventListener("click", () => answer(entry.id, true));
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "primary";
+  submit.textContent = "Send answer";
+  footer.append(cancel, submit);
+  form.append(options, label, input, footer);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    answer(entry.id, false);
+  });
+  const status = document.createElement("p");
+  status.className = "question-state";
+  node.append(form, status);
+}
+
+function updateQuestion(node, entry) {
+  if (!node) return;
+  const pending = entry.question.status === "pending";
+  node.querySelector(".question-form").hidden = !pending;
+  node.querySelector(".question-state").textContent = {
+    pending: "Waiting for your answer",
+    answered: "Answered",
+    cancelled: "Cancelled",
+    inactive: "Agent stopped · question inactive",
+  }[entry.question.status];
+  const input = node.querySelector("textarea");
+  if (document.activeElement !== input)
+    input.value = state.view.answers[entry.id] || "";
+  for (const button of node.querySelectorAll(".question-options button"))
+    button.setAttribute(
+      "aria-pressed",
+      String(button.textContent === input.value),
+    );
+  for (const control of node.querySelectorAll("button, textarea"))
+    control.disabled = !state.connected || state.busy.has(entry.id);
+}
+
+function editAnswer(questionId, text) {
+  state.view.answers[questionId] = text;
+  state.dirty = true;
+  scheduleSave();
+}
+async function answer(questionId, cancel) {
+  const text = cancel
+    ? "Question cancelled. Do not proceed with work that requires this answer."
+    : state.view.answers[questionId] || "";
+  if (!text.trim()) return;
+  await busy(questionId, async () => {
+    await request("answer", {
+      conversation_id: state.active,
+      question_id: questionId,
+      text,
+      cancel,
+    });
+    delete state.view.answers[questionId];
+    state.dirty = true;
+    scheduleSave();
+  });
+}
+
+function capturePosition() {
+  const scroller = ui.transcript;
+  const atBottom =
+    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+  const top = scroller.getBoundingClientRect().top;
+  const anchor = [...ui.messages.children].find(
+    (node) => node.getBoundingClientRect().bottom > top,
+  );
+  return {
+    at_bottom: atBottom,
+    anchor: anchor?.dataset.id || null,
+    offset: anchor ? anchor.getBoundingClientRect().top - top : 0,
+  };
+}
+function applyPosition(position) {
+  if (position.at_bottom) {
+    ui.transcript.scrollTop = ui.transcript.scrollHeight;
+    ui.latest.hidden = true;
+  } else if (position.anchor) {
+    const node = document.getElementById(`message-${position.anchor}`);
+    if (node)
+      ui.transcript.scrollTop +=
+        node.getBoundingClientRect().top -
+        ui.transcript.getBoundingClientRect().top -
+        position.offset;
+  }
+}
+async function restorePosition(position) {
+  state.restoring = true;
+  try {
+    while (
+      !position.at_bottom &&
+      position.anchor &&
+      !state.entries.has(position.anchor) &&
+      state.hasMore &&
+      !state.loading
+    )
+      await loadEarlier();
+    requestAnimationFrame(() => {
+      applyPosition(position);
+      state.restoring = false;
+    });
+  } catch (error) {
+    state.restoring = false;
+    notice(error.message);
+  }
+}
+async function loadEarlier() {
+  if (state.loading || !state.hasMore || !state.entries.size) return;
+  state.loading = true;
+  try {
+    const position = capturePosition();
+    const before = state.entries.keys().next().value;
+    const page = await request("history", {
+      conversation_id: state.active,
+      before,
+    });
+    state.entries = new Map([
+      ...page.entries.map((entry) => [entry.id, entry]),
+      ...state.entries,
+    ]);
+    state.hasMore = page.has_more;
+    renderEntries();
+    applyPosition(position);
+  } finally {
+    state.loading = false;
+    ui.older.disabled = false;
+  }
+}
+
+function scheduleSave() {
+  renderSaved();
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(() => {
+    saveView().catch((error) => notice(error.message));
+  }, 300);
+}
+async function saveView() {
+  if (!state.dirty || state.saving || !state.active || !state.connected) return;
+  state.saving = true;
+  const view = structuredClone(state.view);
+  const encoded = JSON.stringify(view);
+  const conversationId = state.active;
+  try {
+    const result = await request("save_view", {
+      conversation_id: conversationId,
+      revision: state.viewRevision,
+      view,
+    });
+    if (state.active === conversationId) {
+      state.viewRevision = Math.max(state.viewRevision, result.view_revision);
+      if (JSON.stringify(state.view) === encoded) state.dirty = false;
+    }
+  } finally {
+    state.saving = false;
+    renderSaved();
+  }
+  if (state.dirty) scheduleSave();
+}
+async function busy(key, action) {
+  if (state.busy.has(key)) return;
+  state.busy.add(key);
+  renderHeader();
+  if (state.conversation) renderEntries();
+  try {
+    notice();
+    await action();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    state.busy.delete(key);
+    renderHeader();
+    if (state.conversation) renderEntries();
+  }
+}
+
+async function flushView() {
+  if (!state.dirty && !state.saving) return;
+  await saveView();
+  if (state.dirty || state.saving)
+    throw new Error(
+      "Wait for your draft to save before opening another conversation.",
+    );
+}
+
+ui["create-form"].addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = ui["first-message"].value;
+  if (!text.trim()) return;
+  if (bytes(text) > MAX_BODY) {
+    notice("Message is too long (maximum 64 KiB).");
+    return;
+  }
+  busy("create", async () => {
+    await flushView();
+    const result = await request("create", { agent: ui.agent.value, text });
+    state.home = false;
+    window.name = `mobile-chat:${result.conversation_id}`;
+    if (ui["first-message"].value === text) ui["first-message"].value = "";
+  });
+});
+ui.composer.addEventListener("submit", (event) => {
+  event.preventDefault();
   const text = ui.text.value;
   if (!text.trim()) return;
-  if (new TextEncoder().encode(text).length > MAX_WRITE_BYTES) {
-    showNotice({
-      ok: false,
-      message: `Over ${MAX_WRITE_BYTES} bytes. Write it to a file and send the path instead.`,
-    });
+  if (bytes(text) > MAX_BODY) {
+    notice("Message is too long (maximum 64 KiB).");
     return;
   }
-  if (send({ op: "send", text })) {
-    ui.text.value = "";
-    updateCount();
-  }
-}
-
-ui.start.addEventListener("click", () => {
-  if (!state.windowId) {
-    showNotice({
-      ok: false,
-      message: "Chan has not sent this window's session context yet.",
-    });
-    return;
-  }
-  send({ op: "start", agent: ui.agent.value, window_id: state.windowId });
+  busy("send", async () => {
+    await request("send", { conversation_id: state.active, text });
+    if (ui.text.value === text) {
+      ui.text.value = "";
+      state.view.draft = "";
+      state.dirty = true;
+      scheduleSave();
+    }
+  });
 });
-ui.send.addEventListener("click", sendMessage);
-ui.peek.addEventListener("click", () => send({ op: "peek" }));
-for (const op of ["nudge", "escape", "restart", "close"]) {
-  el(op).addEventListener("click", () => send({ op }));
-}
-ui.text.addEventListener("input", updateCount);
+ui.text.addEventListener("input", () => {
+  state.view.draft = ui.text.value;
+  state.dirty = true;
+  scheduleSave();
+});
 ui.text.addEventListener("keydown", (event) => {
-  // Enter sends; Shift+Enter is a newline. On a phone the on-screen keyboard's
-  // return key is the natural send.
-  if (event.key === "Enter" && !event.shiftKey) {
+  // Return composes on a phone. Desktop Ctrl/Cmd+Enter sends.
+  if (
+    event.key === "Enter" &&
+    (event.ctrlKey || event.metaKey) &&
+    !event.isComposing
+  ) {
     event.preventDefault();
-    sendMessage();
+    ui.composer.requestSubmit();
   }
 });
-
+ui.home.addEventListener("click", () => {
+  state.home = !state.home;
+  renderHeader();
+});
+ui.another.addEventListener("click", () => {
+  state.home = true;
+  renderHeader();
+  ui["first-message"].focus();
+});
+ui.peek.addEventListener("click", () =>
+  busy("peek", async () => {
+    const target = await request("peek", { conversation_id: state.active });
+    window.parent.postMessage(
+      { type: "chan:extension-focus-terminal:v1", ...target },
+      "*",
+    );
+  }),
+);
+ui.stop.addEventListener("click", () =>
+  busy("stop", async () => {
+    ui.actions.open = false;
+    await request("stop", { conversation_id: state.active });
+  }),
+);
+ui["connect-agent"].addEventListener("click", () =>
+  busy("connect-agent", () =>
+    request("connect_agent", { conversation_id: state.active }),
+  ),
+);
+ui.older.addEventListener("click", () =>
+  loadEarlier().catch((error) => notice(error.message)),
+);
+ui.latest.addEventListener("click", () => {
+  applyPosition({ at_bottom: true });
+});
+ui.transcript.addEventListener(
+  "scroll",
+  () => {
+    if (state.restoring || !state.active || state.home) return;
+    const position = capturePosition();
+    if (position.at_bottom) ui.latest.hidden = true;
+    Object.assign(state.view, position);
+    state.dirty = true;
+    scheduleSave();
+  },
+  { passive: true },
+);
+window.addEventListener("pagehide", () => {
+  saveView().catch(() => {});
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) saveView().catch(() => {});
+});
 window.addEventListener("message", (event) => {
   if (event.source !== window.parent) return;
   const message = event.data;
   if (!message || typeof message !== "object") return;
-
-  if (message.type === HOST_SESSION) {
-    if (typeof message.self_id === "string" && message.self_id) {
-      state.windowId = message.self_id;
-      if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        send({ op: "hello", window_id: state.windowId });
-      }
-    }
-  } else if (message.type === HOST_COMMAND && typeof message.id === "string") {
-    const ok = message.id === "peek" ? send({ op: "peek" }) : false;
-    window.parent.postMessage(
-      { type: HOST_RESULT, request_id: message.request_id, ok },
-      "*",
-    );
-  } else if (message.type === HOST_VIEW) {
-    // Nothing to pause: the extension does the polling, not this frame.
-  }
+  if (message.type === HOST_SESSION && typeof message.self_id === "string") {
+    state.context = {
+      window_id: message.self_id,
+      tab_id: message.tab_id || null,
+      pane_id: message.pane_id || null,
+    };
+    renderHeader();
+    if (state.connected) hello().catch((error) => notice(error.message));
+  } else if (
+    message.type === "chan:extension-host-keymap:v1" &&
+    Array.isArray(message.keys)
+  )
+    state.hostKeys = message.keys;
 });
-
-if (!state.hostReady) {
-  state.hostReady = true;
-  window.parent.postMessage({ type: HOST_READY }, "*");
-}
-
+window.addEventListener("keydown", (event) => {
+  if (
+    event.defaultPrevented ||
+    !state.hostKeys?.some((key) =>
+      ["code", "ctrlKey", "altKey", "metaKey", "shiftKey"].every(
+        (field) => key[field] === event[field],
+      ),
+    )
+  )
+    return;
+  event.preventDefault();
+  window.parent.postMessage(
+    {
+      type: "chan:extension-keydown:v1",
+      code: event.code,
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      repeat: event.repeat,
+    },
+    "*",
+  );
+});
+window.parent.postMessage({ type: HOST_READY }, "*");
 connect();

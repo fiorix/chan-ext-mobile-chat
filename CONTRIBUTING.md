@@ -17,16 +17,55 @@ Keep changes narrow, use conventional commit messages, stage explicit pathspecs,
 
 That runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Run it after the last edit, not before one: a check that ran before a later change proves nothing about the change.
 
-## Testing what cannot be unit tested
+## Integration checks
 
-The parts of this extension that break are the parts that talk to Chan, and none of them are reachable from a unit test. The tests that exist pin the contracts instead: that the handshake satisfies Chan's validation, that the generated team config satisfies Chan's, that no asset uses an origin-rooted URL (the iframe has an opaque origin at a capability path), and that `[hidden]` still outranks the flex layout rules.
+Rust tests cover atomic persistence, helper authentication over a real loopback WebSocket, scope retirement, duplicate requests, drafts, direct launch, explicit connection, terminal-write failures, and stopping. A fake `cs` executable checks observable command arguments and delivery counts. The gate therefore needs permission to bind loopback sockets.
 
-For anything behavioural, run a real Chan against a throwaway workspace rather than reasoning about it:
+The browser regression uses real Chan terminals with a deterministic interactive agent. Start with a throwaway Chan home and workspace, using a Chan build with the [companion bridge](host/README.md):
 
 ```sh
-CHAN_HOME=/tmp/mc-home chan devserver --service none --bind 127.0.0.1 --port 7788
+mc_test=$(mktemp -d)
+mkdir -p "$mc_test/home" "$mc_test/workspace"
+CHAN_HOME="$mc_test/home" MOBILE_CHAT_INSTALL_ROOT="$mc_test/install" ./scripts/install-chan-extension.sh
 ```
 
-with the declaration copied into `$CHAN_HOME/extensions/`, then mount the workspace over the management API and open the tenant in a browser. A `chan open` without `CHAN_NO_DESKTOP_HANDOFF=1` will hand off to a running Chan desktop instead.
+Write `$mc_test/home/mobile-chat.toml` with the following content, replacing both absolute paths. The Node fixture accepts the initial prompt used by Claude/Codex and all three submit chords. Kimi exercises explicit **Connect chat**.
 
-Reinstall before restarting. A stale binary against a new config produces a confusing error that looks like a bug in the config.
+```toml
+agents = ["claude", "codex", "kimi"]
+[health]
+poll_interval_secs = 1
+[agent.claude]
+command = "node /absolute/checkout/scripts/tests/agent-fixture.mjs /absolute/test/agent-events.jsonl"
+[agent.codex]
+command = "node /absolute/checkout/scripts/tests/agent-fixture.mjs /absolute/test/agent-events.jsonl"
+[agent.kimi]
+command = "node /absolute/checkout/scripts/tests/agent-fixture.mjs /absolute/test/agent-events.jsonl"
+```
+
+Start Chan in a separate terminal and use its printed authenticated URL:
+
+```sh
+CHAN_HOME="$mc_test/home" CHAN_UPDATE_CHECK=0 chan serve "$mc_test/workspace" --standalone --port 0 --no-browser
+```
+
+Install the browser test dependency outside the repository and run the flow:
+
+```sh
+npm install --prefix "$mc_test/tools" playwright
+PLAYWRIGHT_BROWSERS_PATH="$mc_test/browsers" "$mc_test/tools/node_modules/.bin/playwright" install chromium
+MOBILE_CHAT_PLAYWRIGHT="$mc_test/tools/node_modules/playwright/index.mjs" \
+PLAYWRIGHT_BROWSERS_PATH="$mc_test/browsers" \
+MOBILE_CHAT_TEST_URL='http://127.0.0.1:PORT/?t=TOKEN' \
+MOBILE_CHAT_TEST_EVENTS="$mc_test/agent-events.jsonl" \
+MOBILE_CHAT_TEST_OUTPUT="$mc_test/screenshots" \
+node scripts/tests/browser-flow.mjs
+```
+
+The browser checks reload, drafts, pending answers, reconnect, lost acknowledgments, independent conversations, long history, reading position, messages above 4096 bytes, Peek, stopping one agent, and closing/reopening a chat. It saves a mobile screenshot and captures the page on failure. Shut down the disposable Chan process afterward; closing the test browser intentionally leaves agents running.
+
+Also smoke-test installed Claude, Codex, and Kimi with their existing settings. Native trust, login, or permission prompts belong in Peek. For Kimi, wait for the normal prompt before choosing **Connect chat**. Verify a completed reply, a question, and a response to the answer. Do not automatically submit bootstrap text into a native startup dialog.
+
+Finally, verify through `https://gw.chan.app` on a phone. A local browser check does not establish gateway authentication, forwarding, or soft-keyboard behavior on the user's device.
+
+Reinstall the extension before every integration run involving asset or Rust changes. The embedded assets come from the built executable.
