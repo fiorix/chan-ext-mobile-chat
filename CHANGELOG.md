@@ -4,6 +4,10 @@ This file records notable development history and design decisions. Reference do
 
 ## 2026-09-07
 
+### v0.3.0
+
+Release persistent conversations, inline replies and questions, and independent agent sessions. Requires Chan v0.86.0 or newer; full tab and workspace restoration and exact Peek selection additionally require the companion Chan patch in `host/`. Claude and Codex connect through their initial prompt; Kimi uses **Connect chat** after startup.
+
 ### Persistent conversations
 
 Replace the team-and-survey prototype with independent conversations and directly spawned Claude, Codex, and Kimi terminals. Add a conversation-bound helper for readiness, reads, Markdown replies, progress, and asynchronous inline questions. Retain history, drafts, partial answers, reading position, and request receipts using private atomic snapshots.

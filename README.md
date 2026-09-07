@@ -6,17 +6,23 @@ Each Mobile Chat tab opens one conversation. Choose an agent and send a first me
 
 Conversations, composer drafts, partial answers, and reading position are saved on the devserver. Closing a chat tab leaves its agent running. Reopen it from **Saved conversations**, or use **Stop agent** to end that agent and retain its history. **Peek** selects its terminal for native CLI permission or login prompts; Chan's A/B toggle returns to chat.
 
-## Install from this checkout
+## Install
+
+Install v0.3.0 from the release assets:
+
+```sh
+curl -fsSL https://github.com/fiorix/chan-ext-mobile-chat/releases/download/v0.3.0/install.sh | MOBILE_CHAT_VERSION=v0.3.0 bash
+```
+
+Or build and install this checkout:
 
 ```sh
 ./scripts/install-chan-extension.sh
 ```
 
-This builds the extension, installs it under `~/.local/lib/mobile-chat`, and writes its declaration at `~/.chan/extensions/mobile-chat.toml`. Override the roots with `MOBILE_CHAT_INSTALL_ROOT` and `CHAN_HOME`. Restart Chan, then open **Mobile Chat** from the command launcher's Apps category. Rebuild and reinstall after changing embedded browser assets.
+Both methods install the extension under `~/.local/lib/mobile-chat` and write its declaration at `~/.chan/extensions/mobile-chat.toml`. Override the roots with `MOBILE_CHAT_INSTALL_ROOT` and `CHAN_HOME`. Restart Chan, then open **Mobile Chat** from the command launcher's Apps category. Rebuild and reinstall after changing embedded browser assets.
 
 Use Chan v0.86.0 or newer for `cs terminal new --command` and repeated `--env`. The complete restoration flow also needs the small [companion Chan patch](host/README.md), tested against Chan 0.96.0. It supplies persistent extension-instance and workspace identities, plus exact terminal selection for Peek. Without it, reopen saved conversations manually after restoring a window; history across a Chan restart remains scoped to that older runtime. No host changes are installed by the extension installer.
-
-The published v0.2.0 release uses the earlier survey interface. Build this checkout to test the conversation flow described here.
 
 Releases ship native binaries for four targets, each compiled and tested on its own GitHub-hosted runner. The Linux builds target musl, so they carry no libc dependency.
 
