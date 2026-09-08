@@ -252,6 +252,17 @@ binary_path="$install_root/$executable_name"
 copy_atomic "$payload/$executable_name" "$binary_path" 0755
 copy_atomic "$payload/licenses/LICENSE-APACHE" "$install_root/licenses/LICENSE-APACHE" 0644
 
+# Chan launches extensions with its own environment; a desktop app started
+# from Finder has no ~/.local/bin on PATH, so `cs` must also resolve as a
+# sibling of this binary (locate_binary's fallback).
+cs_name=cs
+((windows)) && cs_name=cs.exe
+if cs_path=$(command -v "$cs_name"); then
+    ln -sfn "$cs_path" "$install_root/$cs_name"
+else
+    printf 'mobile-chat-install: warning: cs not found on PATH; set MOBILE_CHAT_CS or place cs next to %s\n' "$binary_path" >&2
+fi
+
 config_dir="$chan_home/extensions"
 config_path="$config_dir/mobile-chat.toml"
 mkdir -p "$config_dir"

@@ -18,6 +18,16 @@ install -d "$install_root" "$licenses_dir" "$config_dir"
 install -m 0755 target/release/mobile-chat-extension "$binary_path"
 install -m 0644 LICENSE-APACHE "$licenses_dir/LICENSE-APACHE"
 
+# Chan launches extensions with its own environment; a desktop app started
+# from Finder has no ~/.local/bin on PATH, so `cs` must also resolve as a
+# sibling of this binary (locate_binary's fallback).
+cs_path=$(command -v cs || true)
+if [[ -n "$cs_path" ]]; then
+    ln -sfn "$cs_path" "$install_root/cs"
+else
+    printf 'warning: cs not found on PATH; set MOBILE_CHAT_CS or place cs next to %s\n' "$binary_path" >&2
+fi
+
 toml_command=${binary_path//\\/\\\\}
 toml_command=${toml_command//\"/\\\"}
 config_tmp=$(mktemp "$config_path.tmp.XXXXXX")
