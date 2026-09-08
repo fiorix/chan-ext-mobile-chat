@@ -58,6 +58,7 @@ pub struct Config {
 
     /// The WhatsApp bridge. Read once at startup; `enabled = false` (the
     /// default) changes nothing until someone opts in.
+    #[cfg(feature = "whatsapp")]
     #[serde(default)]
     pub whatsapp: Whatsapp,
 }
@@ -111,7 +112,9 @@ pub struct Agent {
 /// WhatsApp bridge configuration, the `[whatsapp]` section of
 /// `mobile-chat.toml`. Read once at startup, so changes here take effect when
 /// Chan restarts; everything a person changes from the phone lives in the
-/// bridge's own `settings.json` and reloads live instead.
+/// bridge's own `settings.json` and reloads live instead. Only compiled with
+/// the `whatsapp` feature; without it a `[whatsapp]` section is unknown.
+#[cfg(feature = "whatsapp")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Whatsapp {
@@ -174,18 +177,22 @@ fn default_boot_timeout_secs() -> u64 {
     45
 }
 
+#[cfg(feature = "whatsapp")]
 fn default_log_max_bytes() -> u64 {
     1024 * 1024
 }
 
+#[cfg(feature = "whatsapp")]
 fn default_log_keep() -> u32 {
     10
 }
 
+#[cfg(feature = "whatsapp")]
 fn default_media_max_bytes() -> u64 {
     16 * 1024 * 1024
 }
 
+#[cfg(feature = "whatsapp")]
 fn default_media() -> Vec<String> {
     ["image", "video", "audio", "document", "sticker"]
         .iter()
@@ -193,10 +200,12 @@ fn default_media() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "whatsapp")]
 fn default_reply_progress() -> bool {
     true
 }
 
+#[cfg(feature = "whatsapp")]
 impl Default for Whatsapp {
     fn default() -> Self {
         Self {
@@ -234,6 +243,7 @@ impl Default for Config {
             agents: default_agents(),
             agent: BTreeMap::new(),
             health: Health::default(),
+            #[cfg(feature = "whatsapp")]
             whatsapp: Whatsapp::default(),
         }
     }
@@ -496,6 +506,7 @@ mod tests {
         assert!(Config::load(&path).is_err());
     }
 
+    #[cfg(feature = "whatsapp")]
     #[test]
     fn whatsapp_defaults_apply_when_the_section_is_absent() {
         let (_dir, path) = write("agents = [\"claude\"]\n");
@@ -512,6 +523,7 @@ mod tests {
         assert!(whatsapp.reply_progress);
     }
 
+    #[cfg(feature = "whatsapp")]
     #[test]
     fn a_full_whatsapp_section_parses() {
         let (_dir, path) = write(
@@ -535,6 +547,7 @@ mod tests {
         assert!(!whatsapp.reply_progress);
     }
 
+    #[cfg(feature = "whatsapp")]
     #[test]
     fn an_unknown_key_in_the_whatsapp_section_is_rejected() {
         let (_dir, path) = write(

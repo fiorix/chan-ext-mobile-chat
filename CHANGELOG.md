@@ -2,6 +2,20 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## Unreleased
+
+### WhatsApp bridge
+
+Add an opt-in WhatsApp bridge as a second surface next to the chat iframe. Enabling `[whatsapp] enabled = true` in `mobile-chat.toml` pairs the extension to a WhatsApp account as a linked device; pairing is driven over the control socket, and the pushed status payload carries the QR code as inline SVG, raw string, and a `wa.me` deep link alongside the linked jid and any error. The bridge rebuilds the connection against the same session store when the server runs out of QR refs, and `whatsapp_unpair` deletes the linked-device session.
+
+Record every message of enabled chats into per-chat JSONL logs under `<chan-home>/mobile-chat/whatsapp/`, one directory per chat, rotated on whole-record boundaries past `log_max_bytes` with `log_keep` files retained, with media captured under per-kind subdirectories gated by type and `media_max_bytes`. Messages the bridge itself sends are logged with their conversation and entry ids, so each log is a complete transcript rather than only the inbound half.
+
+The allowlist is default deny, keyed on the sender's phone number in E.164 without a plus, with observed LID counterparts resolving a LID-addressed sender to the same person; a non-allowlisted sender in a recorded chat is logged and silently ignored. An allowlisted sender drives the bound conversation with `/agent`: prompts, question answers by position or free text, cancels, and status, with failure paths answered by auto-replies debounced to one per chat per 60 seconds.
+
+Assistant replies, progress updates, and questions route back into the WhatsApp chat, rendered from Markdown to WhatsApp formatting and chunked at 3500 characters; questions carry numbered options answerable with `/agent 1`. The last forwarded entry persists in `settings.json` so a restart does not replay the transcript.
+
+The bridge lives in a new `whatsapp-bridge` library crate behind the default-on `whatsapp` cargo feature of the binary; `--no-default-features` builds core-only. Size, measured on the host aarch64 release binary: the pre-bridge baseline was 4,686,640 bytes; the dependency-viability scaffold alone added about 50 KB, and the fully wired bridge ships at 28,909,552 bytes — +24,222,912 bytes, about 5.2× — the bulk of it the pinned `whatsapp-rust =0.7.0` tree with its bundled SQLite and ring.
+
 ## 2026-09-07
 
 ### v0.3.0

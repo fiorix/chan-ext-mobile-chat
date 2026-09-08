@@ -7,6 +7,8 @@ mod markdown;
 mod model;
 mod session;
 mod store;
+#[cfg(feature = "whatsapp")]
+mod whatsapp;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -72,6 +74,11 @@ struct AppState {
     address: SocketAddr,
     executable: PathBuf,
     tenants: Mutex<HashMap<String, Arc<Tenant>>>,
+    /// The process-wide WhatsApp bridge, initialized once in `main` after
+    /// the rest of the state exists (the bridge's `Host` seam points back
+    /// here).
+    #[cfg(feature = "whatsapp")]
+    whatsapp: std::sync::OnceLock<Arc<whatsapp::Whatsapp>>,
 }
 
 struct Tenant {
@@ -283,7 +290,15 @@ async fn main() -> Result<()> {
         address,
         executable: std::env::current_exe()?,
         tenants: Mutex::new(HashMap::new()),
+        #[cfg(feature = "whatsapp")]
+        whatsapp: std::sync::OnceLock::new(),
     });
+    #[cfg(feature = "whatsapp")]
+    if let Some(whats) = whatsapp::start(Arc::clone(&state)).await?
+        && state.whatsapp.set(whats).is_err()
+    {
+        bail!("The WhatsApp bridge initialized twice.");
+    }
     let app = router(state);
     println!("CHAN_EXTENSION_V1={}", handshake(address, &token));
     use std::io::Write;
@@ -371,9 +386,19 @@ async fn control_socket(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     tenant.activate();
+    #[cfg(feature = "whatsapp")]
+    let whatsapp = state.whatsapp.get().cloned();
     Ok(upgrade
         .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| serve_control(tenant, persistent, socket)))
+        .on_upgrade(move |socket| {
+            serve_control(
+                tenant,
+                persistent,
+                #[cfg(feature = "whatsapp")]
+                whatsapp,
+                socket,
+            )
+        }))
 }
 
 #[derive(Clone, Default)]
@@ -434,12 +459,34 @@ enum ClientAction {
     ConnectAgent {
         conversation_id: String,
     },
+    #[cfg(feature = "whatsapp")]
+    WhatsappStatus,
+    #[cfg(feature = "whatsapp")]
+    WhatsappPair,
+    #[cfg(feature = "whatsapp")]
+    WhatsappUnpair,
+    #[cfg(feature = "whatsapp")]
+    WhatsappChats,
+    #[cfg(feature = "whatsapp")]
+    WhatsappSetChat {
+        jid: String,
+        #[serde(default)]
+        record: Option<bool>,
+        #[serde(default)]
+        conversation_id: Option<String>,
+    },
+    #[cfg(feature = "whatsapp")]
+    WhatsappAllow {
+        number: String,
+        allow: bool,
+    },
 }
 
 async fn handle_client(
     tenant: &Arc<Tenant>,
     context: &mut BrowserContext,
     active: &mut Option<String>,
+    #[cfg(feature = "whatsapp")] whatsapp: Option<&whatsapp::Whatsapp>,
     request: ClientRequest,
 ) -> Result<Value> {
     tenant.runtime.ensure_active()?;
@@ -538,17 +585,65 @@ async fn handle_client(
         ClientAction::ConnectAgent { conversation_id } => {
             tenant.get(&conversation_id)?.connect_agent().await
         }
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappStatus => Ok(whatsapp.context("WhatsApp is disabled.")?.status()),
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappPair => whatsapp.context("WhatsApp is disabled.")?.pair().await,
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappUnpair => whatsapp.context("WhatsApp is disabled.")?.unpair().await,
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappChats => whatsapp.context("WhatsApp is disabled.")?.chats().await,
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappSetChat {
+            jid,
+            record,
+            conversation_id,
+        } => {
+            let whatsapp = whatsapp.context("WhatsApp is disabled.")?;
+            whatsapp
+                .set_chat(tenant, &jid, record, conversation_id)
+                .await
+        }
+        #[cfg(feature = "whatsapp")]
+        ClientAction::WhatsappAllow { number, allow } => {
+            whatsapp
+                .context("WhatsApp is disabled.")?
+                .set_allow(&number, allow)
+                .await
+        }
     }
 }
 
-async fn serve_control(tenant: Arc<Tenant>, persistent: bool, socket: WebSocket) {
+async fn serve_control(
+    tenant: Arc<Tenant>,
+    persistent: bool,
+    #[cfg(feature = "whatsapp")] whatsapp: Option<Arc<whatsapp::Whatsapp>>,
+    socket: WebSocket,
+) {
     let (mut sink, mut stream) = socket.split();
     let mut updates = tenant.updates.subscribe();
+    // The process-wide WhatsApp status, pushed to every control socket. When
+    // the bridge never initialized, a forgotten sender keeps the arm silent.
+    #[cfg(feature = "whatsapp")]
+    let mut wa_updates = match &whatsapp {
+        Some(whats) => whats.subscribe(),
+        None => {
+            let (tx, rx) = tokio::sync::watch::channel(Value::Null);
+            std::mem::forget(tx);
+            rx
+        }
+    };
     let mut context = BrowserContext::default();
     let mut active = None;
     if send_json(&mut sink, tenant.snapshot(None, persistent))
         .await
         .is_err()
+    {
+        return;
+    }
+    #[cfg(feature = "whatsapp")]
+    if let Some(whats) = &whatsapp
+        && send_json(&mut sink, whats.status()).await.is_err()
     {
         return;
     }
@@ -559,13 +654,46 @@ async fn serve_control(tenant: Arc<Tenant>, persistent: bool, socket: WebSocket)
                 if matches!(update, Err(broadcast::error::RecvError::Closed)) { return; }
                 if send_json(&mut sink, tenant.snapshot(active.as_deref(), persistent)).await.is_err() { return; }
             }
+            changed = async {
+                #[cfg(feature = "whatsapp")]
+                {
+                    wa_updates.changed().await
+                }
+                #[cfg(not(feature = "whatsapp"))]
+                {
+                    std::future::pending::<Result<(), std::convert::Infallible>>().await
+                }
+            } => {
+                #[cfg(feature = "whatsapp")]
+                match changed {
+                    Ok(()) => {
+                        let payload = wa_updates.borrow_and_update().clone();
+                        if send_json(&mut sink, payload).await.is_err() { return; }
+                    }
+                    Err(_) => {
+                        // The process-wide status is gone; stop selecting on it.
+                        let (tx, rx) = tokio::sync::watch::channel(Value::Null);
+                        std::mem::forget(tx);
+                        wa_updates = rx;
+                    }
+                }
+                #[cfg(not(feature = "whatsapp"))]
+                let _ = changed;
+            }
             incoming = stream.next() => {
                 let Some(Ok(message)) = incoming else { return };
                 let Message::Text(text) = message else { continue };
                 let reply = match serde_json::from_str::<ClientRequest>(&text) {
                     Ok(request) => {
                         let id = request.id.clone();
-                        match handle_client(&tenant, &mut context, &mut active, request).await {
+                        match handle_client(
+                            &tenant,
+                            &mut context,
+                            &mut active,
+                            #[cfg(feature = "whatsapp")]
+                            whatsapp.as_deref(),
+                            request,
+                        ).await {
                             Ok(result) => json!({"type": "result", "id": id, "ok": true, "result": result}),
                             Err(error) => json!({"type": "result", "id": id, "ok": false, "error": format!("{error:#}")}),
                         }
@@ -650,6 +778,8 @@ mod tests {
             address,
             executable: PathBuf::from("/helper"),
             tenants: Mutex::new(HashMap::new()),
+            #[cfg(feature = "whatsapp")]
+            whatsapp: std::sync::OnceLock::new(),
         });
         let router = router(Arc::clone(&state));
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

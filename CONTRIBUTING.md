@@ -17,6 +17,22 @@ Keep changes narrow, use conventional commit messages, stage explicit pathspecs,
 
 That runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Run it after the last edit, not before one: a check that ran before a later change proves nothing about the change.
 
+## WhatsApp bridge
+
+The bridge is exercisable without a WhatsApp account. Everything except the live socket runs against seams:
+
+- `WaSink`, the send/download trait, has a recording stub in the routing and forwarder tests that captures what would have been sent and downloaded instead of touching the network.
+- The `Host` trait has an in-memory fake: a mutable conversation view plus its notification broadcast, driving binding resolution, envelope delivery, question round trips, and lagged-broadcast recovery by full diff.
+- `whatsapp-rust` events are synthetic, built with the crate's `bon` builders and converted at the edge, so pairing and conversion logic tests never connect.
+
+Run the bridge suite with:
+
+```sh
+cargo test -p whatsapp-bridge
+```
+
+For a manual pairing test, install the extension into a throwaway Chan home as in the integration checks below, add `[whatsapp] enabled = true` to its `mobile-chat.toml` (the keys are documented in `README.md`), restart Chan, and drive `whatsapp_pair` over the control socket. The status payload carries the QR as inline SVG and a `wa.me` deep link. Pair a secondary number; the terms-of-service risk of an unofficial client is documented in `README.md`.
+
 ## Integration checks
 
 Rust tests cover atomic persistence, helper authentication over a real loopback WebSocket, scope retirement, duplicate requests, drafts, direct launch, explicit connection, terminal-write failures, and stopping. A fake `cs` executable checks observable command arguments and delivery counts. The gate therefore needs permission to bind loopback sockets.

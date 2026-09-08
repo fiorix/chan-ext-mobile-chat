@@ -23,6 +23,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 anyhow = "1"
+pulldown-cmark = { version = "0.12", default-features = false }
+sha2 = "0.10"
 fs2 = "0.4"
 
 [dev-dependencies]

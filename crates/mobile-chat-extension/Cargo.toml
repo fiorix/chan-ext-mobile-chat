@@ -24,10 +24,20 @@ tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-threa
 tokio-tungstenite = "0.29"
 toml = "0.9"
 whatsapp-bridge = { path = "../whatsapp-bridge", optional = true }
+# Direct, for the SharedSink edge that publishes the live client; features
+# mirror the bridge crate's set exactly.
+whatsapp-rust = { version = "=0.7.0", optional = true, default-features = false, features = [
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "tokio-native",
+    "ureq-client",
+    "signal",
+] }
 
 [features]
 default = ["whatsapp"]
-whatsapp = ["dep:whatsapp-bridge"]
+whatsapp = ["dep:whatsapp-bridge", "dep:whatsapp-rust"]
 
 [lints]
 workspace = true

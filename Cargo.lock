@@ -1292,6 +1292,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "whatsapp-bridge",
+ "whatsapp-rust",
 ]
 
 [[package]]
@@ -2485,8 +2486,10 @@ dependencies = [
  "chrono",
  "fast_qr",
  "fs2",
+ "pulldown-cmark",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "whatsapp-rust",

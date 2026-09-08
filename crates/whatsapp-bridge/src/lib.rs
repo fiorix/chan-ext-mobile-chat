@@ -29,11 +29,126 @@ pub mod store;
 pub mod whatsapp_text;
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::Serialize;
+use tokio::sync::broadcast;
+
+/// A user-to-agent message assembled by the routing layer and handed to the
+/// host for delivery into a conversation. `id` and `fingerprint` follow the
+/// control socket's idempotency scheme: the bridge generates a fresh id per
+/// send and the fingerprint is the sha256 hex of `body`, and the host impl
+/// rejects a duplicate (id, fingerprint) pair it has already accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendRequest {
+    /// Fresh message id, unique per send attempt.
+    pub id: String,
+    /// sha256 hex of `body`; the content fingerprint of the idempotency pair.
+    pub fingerprint: String,
+    /// The envelope text for a prompt, or the answer text for an answer.
+    pub body: String,
+    /// Entry id of the question being answered or cancelled.
+    pub question: Option<String>,
+    /// True for `/agent cancel`.
+    pub cancel: bool,
+}
+
+/// The state of a bound conversation as the host sees it. `Missing` and
+/// `NotLoaded`/`Stopped` are distinct so routing can tell "the binding names
+/// nothing" apart from "the tenant is not loaded" and "the agent stopped";
+/// the latter two share the same honest auto-reply by design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// The conversation does not exist in the tenant's store.
+    Missing,
+    /// The owning tenant has never been loaded (no browser has connected).
+    NotLoaded,
+    /// The tenant is loaded but no agent is running for this conversation.
+    Stopped,
+    Found(ConversationView),
+}
+
+/// A read-only snapshot of a conversation, enough for status replies, the
+/// question-pending decision, and outbound entry diffing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationView {
+    /// The conversation title, as shown in the UI.
+    pub title: String,
+    /// The run phase (`"Booting"`, `"Running"`, `"Waiting"`, ...), human-readable.
+    pub phase: String,
+    /// User entries queued but not yet delivered to or read by the agent.
+    pub queue_depth: usize,
+    /// How many questions are pending an answer.
+    pub pending_questions: usize,
+    pub entries: Vec<EntryView>,
+}
+
+/// One entry of a conversation snapshot. Only assistant entries are
+/// considered for forwarding; `role` says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryView {
+    pub id: String,
+    /// One of `message`, `progress`, `question`.
+    pub kind: String,
+    pub body: String,
+    /// One of `user`, `assistant`, ...
+    pub role: String,
+    /// Agent display name, used to attribute forwarded questions.
+    pub agent_name: String,
+    /// Present on `question` entries.
+    pub question: Option<QuestionView>,
+}
+
+/// The question payload of a `question` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionView {
+    pub options: Vec<String>,
+    pub status: QuestionStatus,
+}
+
+/// Lifecycle of a question entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionStatus {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+/// The narrow seam the routing layer needs over the Mobile Chat host: resolve
+/// a binding, send into a conversation, and subscribe to a tenant's change
+/// notifications. The binary implements this trait; the bridge never sees the
+/// host's `AppState`/`Tenant`/`Chat` types, which would be a circular
+/// dependency. Object-safe: futures are boxed, following the
+/// `async_trait`-style pattern, so `Arc<dyn Host>` serves as the seam.
+pub trait Host: Send + Sync {
+    /// Resolve a binding to its current state; cheap enough to call per
+    /// inbound command and per forwarder pass.
+    fn resolve<'a>(
+        &'a self,
+        owner: &'a str,
+        conversation: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Resolved> + Send + 'a>>;
+    /// Deliver one user message. A rejected send (duplicate idempotency pair,
+    /// stopped agent, failed validation) is an `Err` whose text is already
+    /// written for a human; routing replies it unchanged.
+    fn send<'a>(
+        &'a self,
+        owner: &'a str,
+        conversation: &'a str,
+        send: SendRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Subscribe to a tenant's change notifications; `None` when the tenant is
+    /// not loaded. The channel carries no payload: consumers re-read through
+    /// [`Host::resolve`], so a lagged receiver loses nothing.
+    fn subscribe<'a>(
+        &'a self,
+        owner: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<broadcast::Receiver<()>>> + Send + 'a>>;
+}
 
 /// Startup values of the `[whatsapp]` config section that the bridge needs at
 /// construction time. `root` is resolved by the caller (config override or

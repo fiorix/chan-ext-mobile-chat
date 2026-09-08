@@ -97,6 +97,65 @@ An `ask` returns immediately. The agent finishes any independent work, calls `ag
 
 Markdown replies support code, lists, links, and tables. Raw HTML is escaped, unsafe link schemes are disabled, and remote images are omitted.
 
+## WhatsApp bridge
+
+Opt-in second surface: pair the extension to a WhatsApp account as a linked device, record enabled chats to rotating on-disk logs, and let allowlisted people drive an already running agent with `/agent`. Off by default; enable it in `<chan-home>/mobile-chat.toml`:
+
+```toml
+[whatsapp]
+enabled = true            # default false; off means no directory, no lock, no network
+root = "/optional/override"  # data root; default <chan-home>/mobile-chat/whatsapp
+log_max_bytes = 1048576   # rotate log.jsonl when appending would pass this size; default 1 MiB
+log_keep = 10             # rotated logs retained per chat
+media_max_bytes = 16777216  # a single media file larger than this is not stored; default 16 MiB
+media = ["image", "video", "audio", "document", "sticker"]
+reply_progress = true     # forward agent progress updates, not just final replies
+```
+
+The bridge is a `whatsapp-bridge` library crate linked into the binary behind the default-on `whatsapp` cargo feature; build with `--no-default-features` for a core-only build. A `[whatsapp]` section is unknown to a core-only binary, so keep it out of the config there. Keys here are read once at startup and take effect when Chan restarts; everything a person changes from the phone lives in the bridge's own `settings.json` and reloads live.
+
+The welcome screen's WhatsApp panel is the pairing surface: it shows the QR as inline SVG with a countdown to the next rotation, the raw payload in a copyable field, the `wa.me` deep link, and a Regenerate button. The panel drives the same control-socket actions a client can send by hand: `whatsapp_pair` starts or restarts pairing, `whatsapp_unpair` logs out and deletes the linked-device session, and `whatsapp_status` pushes the status payload to every connected socket as codes rotate. The server hands out six refs per connection (60 seconds for the first, 20 for each of the other five); when they run out the bridge rebuilds the connection and a fresh code appears in the next push. `qr_svg` is the scan code, `qr_raw` the raw payload, and `qr_deep_link` a `wa.me` link openable from the phone's camera.
+
+Everything the bridge keeps lives under `<chan-home>/mobile-chat/whatsapp/`, created at mode 0700 with an exclusive process lock so two Chan homes fail visibly rather than corrupt the store:
+
+```
+lock                       exclusive process lock
+session.db                 linked-device session: device keys, Signal sessions
+settings.json              chat enablement, bindings, allowlist, jid-to-directory index
+chats/<slug>-<hash8>/
+  meta.json                jid, kind, display name, first_seen, last_seen
+  log.jsonl                current log
+  log.1.jsonl .. log.N.jsonl  rotated logs, log_keep retained
+  media/images/...
+  media/video/...
+  media/audio/...
+  media/documents/...
+  media/stickers/...
+```
+
+Each recorded chat gets one directory, named from its display name and the first 8 hex characters of the sha256 of its jid, created once and never renamed so a contact rename does not orphan history. `log.jsonl` holds one JSON object per line, appended and never rewritten, rotated on whole-record boundaries. Attachments land under `media/` gated by the configured types and `media_max_bytes`. Messages the bridge itself sends are logged too, with the conversation and entry ids attached, so each log is a complete transcript rather than only the inbound half.
+
+Recording, binding, and permission are separate switches. Recording decides whether a chat's messages reach the log at all. Binding names an `(owner, conversation)` pair, so a chat bound in one workspace does not resolve from another. The allowlist is default deny, keyed on the sender's phone number in E.164 without a plus, with LID counterparts recorded as they are observed so a LID-addressed sender resolves to the same person; a message from a non-allowlisted sender in a recorded chat is logged and silently ignored, so the bridge never announces itself to strangers.
+
+Commands parse only for an allowlisted sender in a recorded chat; everything else is logged only.
+
+| Input | Effect |
+|---|---|
+| `/agent <prompt>` | Sends the prompt to the bound conversation. |
+| `/agent <answer>` with a question pending | Answers the oldest pending question. A bare integer selects that option by position (1-based); anything else is free text. |
+| `/agent cancel` with a question pending | Cancels the oldest pending question. |
+| `/agent status` or `/agent` with no argument | Reports the bound conversation's title, phase, queue depth, and pending question count. |
+
+The prefix match is case-insensitive on `/agent`, requires it at the start of the message, and tolerates leading whitespace. Failure paths answer with one auto-reply per chat per 60 seconds, debounced so a loop between the bridge and an agent cannot form: unbound chat, no agent running, or the unchanged error text of a refused send.
+
+Assistant output routes back into the same chat through one forwarder task per bound conversation. Final replies always forward, progress updates forward when `reply_progress` is set, and questions forward as the body with numbered options plus a one-line instruction for answering from the phone. Markdown is rendered to WhatsApp's formatting and chunked at 3500 characters with `(1/3)` markers, and the last forwarded entry persists in `settings.json` so a restart does not replay the transcript.
+
+WhatsApp text reaches an agent that runs with its permission checks bypassed, so treat it as the sharpest edge here: every prompt is wrapped in an envelope naming the sender and chat and stating plainly that the text is an untrusted third-party request, never authorization, with the chat log path included so the agent can read context for itself. The chat brief tells the agent the same, and the existing inline-question approval gate still applies to anything irreversible or outward facing. The default-deny allowlist is the only access control; keep it small.
+
+The bridge uses `whatsapp-rust`, an unofficial client: using it may violate Meta's terms and can get the account suspended. Pair a secondary number, and expect the pinned `=0.7.0` dependency to need deliberate work to upgrade.
+
+One trust-dialog note: the extension launches agents interactively, and neither Claude nor Codex offers a flag that pre-accepts the per-directory trust dialog. A first launch in an untrusted directory therefore needs one **Peek** to accept it; after that the directory is remembered. The known alternatives are Claude's `hasTrustDialogAccepted` per-project key and top-level `bypassPermissionsModeAccepted` in `~/.claude.json`, and Codex's `trust_level = "trusted"` per path in `~/.codex/config.toml`. The extension deliberately does not pre-seed them, because that would mean writing durable user config outside the workspace on every spawn.
+
 ## Persistence and recovery
 
 Private atomic snapshots live under `<chan-home>/mobile-chat/`, separated by trusted workspace identity when the companion host bridge is available. Browser tabs have persistent bindings; they do not own the conversation data. Per-run helper credentials stay out of browser snapshots.

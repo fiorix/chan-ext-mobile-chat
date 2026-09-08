@@ -13,6 +13,13 @@ Agreed design. This describes the intended experience; `README.md` describes the
 - Keep **Peek** as the fallback for native CLI permission prompts. Custom integrations for those prompts are outside this design.
 - Investigate the required Chan host changes later.
 
+### WhatsApp bridge
+
+- The WhatsApp client lives in a new workspace library crate, `whatsapp-bridge`, linked into the existing binary behind a default-on cargo feature, not in a separate process. `whatsapp-rust` re-exports its whole stack as one dependency, and Chan already supervises exactly one extension process, so an in-process session is a Chan-wide singleton for free while the extension's own server owns the process lifetime; a second process would add a lifecycle to supervise for no benefit.
+- `/agent` targets only a chat explicitly bound to an existing Mobile Chat conversation, never spawns. Spawning from a text message would put an unreviewed launch decision in the path of untrusted input, while a binding makes the target visible and reviewable in `settings.json`; an unbound chat or a stopped agent gets an honest auto-reply instead.
+- Final replies, progress updates, and questions all flow back to WhatsApp, and questions are answerable from the phone. A phone-only user must see everything the iframe would show, and a question that cannot be answered remotely would strand the agent exactly like an unanswered permission prompt does, so the `/agent` grammar doubles as the answer channel.
+- The agent trust dialog is left alone. No CLI flag exists to pre-accept it, and pre-seeding the Claude or Codex trust keys would mean the extension writing durable user config outside the workspace, so the design accepts the one-time Peek instead and records the known keys as alternatives only.
+
 ## User flow
 
 ### Open a conversation
