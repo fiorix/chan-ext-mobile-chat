@@ -1138,9 +1138,10 @@ const MODIFIER_KEYS = new Set([
   "Unidentified",
 ]);
 const MAC = /Mac OS X|Macintosh/.test(navigator.userAgent);
-// A keydown that enters text (an IME composition, a dead key, AltGr off
-// macOS) names no chord. Option on macOS replaces the key with a glyph, so
-// only then does the physical position decide.
+// A lone modifier, an IME composition, AltGr off macOS, and a dead key the
+// Option fallback cannot place name no chord. A letter or supported symbol
+// the layout typed always wins; only when Option left neither does the
+// physical position decide.
 function shortcutKey(event) {
   const key = event.key;
   if (!key || MODIFIER_KEYS.has(key) || event.isComposing || key === "Process")
