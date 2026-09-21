@@ -24,6 +24,8 @@ Both methods install the extension under `~/.local/lib/mobile-chat` and write it
 
 Use Chan v0.86.0 or newer for `cs terminal new --command` and repeated `--env`. The complete restoration flow also needs the small [companion Chan patch](host/README.md), tested against Chan 0.96.0. It supplies persistent extension-instance and workspace identities, plus exact terminal selection for Peek. Without it, reopen saved conversations manually after restoring a window; history across a Chan restart remains scoped to that older runtime. No host changes are installed by the extension installer.
 
+Chan's shortcuts keep working while the extension has focus through Chan's v2 keyboard relay, in Chan v0.100.0 or newer: the extension relays the chords Chan advertises, matched by the symbol the keyboard layout types. With an older Chan the extension still works, but its frame keeps those keystrokes.
+
 Releases ship native binaries for four targets, each compiled and tested on its own GitHub-hosted runner. The Linux builds target musl, so they carry no libc dependency.
 
 | Platform | Archive |

@@ -1097,36 +1097,114 @@ window.addEventListener("message", (event) => {
     };
     renderHeader();
     if (state.connected) hello().catch((error) => notice(error.message));
-  } else if (
-    message.type === "chan:extension-host-keymap:v1" &&
-    Array.isArray(message.keys)
-  )
-    state.hostKeys = message.keys;
+  }
+});
+// Chan's keyboard relay. Chan advertises the shell chords it claims as key
+// tokens under its layout-aware contract: the letter or punctuation symbol
+// the layout types, the top-row digit by position, or a named key, each with
+// exact modifiers. A keydown that resolves to one is relayed with its raw
+// fields, and Chan resolves and checks it again before acting on it.
+const HOST_KEYMAP = "chan:extension-host-keymap:v2";
+const HOST_KEYDOWN = "chan:extension-keydown:v2";
+const PUNCTUATION_KEYS = new Set(["`", "[", "]", ",", "=", "-", ".", ";", "/"]);
+const SHIFTED_KEYS = new Map([
+  ["~", "`"],
+  ["{", "["],
+  ["}", "]"],
+  ["<", ","],
+  ["+", "="],
+  ["_", "-"],
+  [">", "."],
+  [":", ";"],
+  ["?", "/"],
+]);
+const PUNCTUATION_CODES = new Map([
+  ["Backquote", "`"],
+  ["BracketLeft", "["],
+  ["BracketRight", "]"],
+  ["Comma", ","],
+  ["Equal", "="],
+  ["Minus", "-"],
+  ["Period", "."],
+  ["Semicolon", ";"],
+  ["Slash", "/"],
+]);
+const MODIFIER_KEYS = new Set([
+  "Shift",
+  "Alt",
+  "Control",
+  "Meta",
+  "AltGraph",
+  "Unidentified",
+]);
+const MAC = /Mac OS X|Macintosh/.test(navigator.userAgent);
+// A keydown that enters text (an IME composition, a dead key, AltGr off
+// macOS) names no chord. Option on macOS replaces the key with a glyph, so
+// only then does the physical position decide.
+function shortcutKey(event) {
+  const key = event.key;
+  if (!key || MODIFIER_KEYS.has(key) || event.isComposing || key === "Process")
+    return null;
+  if (!MAC && event.getModifierState("AltGraph")) return null;
+  const token = (name, shifted = false, consumable = false) => ({
+    key: name,
+    shifted,
+    consumable,
+  });
+  const digit = /^Digit([0-9])$/.exec(event.code);
+  if (digit) return token(digit[1]);
+  if (/^[a-z]$/i.test(key)) return token(key.toUpperCase());
+  if (PUNCTUATION_KEYS.has(key)) return token(key, false, true);
+  if (SHIFTED_KEYS.has(key)) return token(SHIFTED_KEYS.get(key), true);
+  if (event.altKey) {
+    const letter = /^Key([A-Z])$/.exec(event.code);
+    const position = letter ? letter[1] : PUNCTUATION_CODES.get(event.code);
+    if (position) return token(position);
+  }
+  if (key === "Dead") return null;
+  return token(key.length === 1 ? key.toUpperCase() : key);
+}
+// The exact chord, or the same chord without a Shift that only typed a
+// punctuation symbol.
+function claimedByHost(event) {
+  const resolved = shortcutKey(event);
+  if (!resolved) return false;
+  const matches = (key, shiftKey) =>
+    key?.key === resolved.key &&
+    key.ctrlKey === event.ctrlKey &&
+    key.altKey === event.altKey &&
+    key.metaKey === event.metaKey &&
+    key.shiftKey === shiftKey;
+  return (state.hostKeys ?? []).some(
+    (key) =>
+      matches(key, event.shiftKey || resolved.shifted) ||
+      (event.shiftKey && resolved.consumable && matches(key, false)),
+  );
+}
+window.addEventListener("message", (event) => {
+  if (event.source !== window.parent) return;
+  if (event.data?.type === HOST_KEYMAP && Array.isArray(event.data.keys))
+    state.hostKeys = event.data.keys;
 });
 window.addEventListener("keydown", (event) => {
-  if (
-    event.defaultPrevented ||
-    !state.hostKeys?.some((key) =>
-      ["code", "ctrlKey", "altKey", "metaKey", "shiftKey"].every(
-        (field) => key[field] === event[field],
-      ),
-    )
-  )
-    return;
+  if (event.defaultPrevented || !claimedByHost(event)) return;
   event.preventDefault();
   window.parent.postMessage(
     {
-      type: "chan:extension-keydown:v1",
-      code: event.code,
+      type: HOST_KEYDOWN,
       key: event.key,
+      code: event.code,
       ctrlKey: event.ctrlKey,
       altKey: event.altKey,
       metaKey: event.metaKey,
       shiftKey: event.shiftKey,
       repeat: event.repeat,
+      isComposing: event.isComposing,
+      altGraph: event.getModifierState("AltGraph"),
     },
     "*",
   );
 });
+// End of Chan's keyboard relay.
 window.parent.postMessage({ type: HOST_READY }, "*");
 connect();

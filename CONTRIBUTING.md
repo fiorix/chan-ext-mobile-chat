@@ -17,6 +17,12 @@ Keep changes narrow, use conventional commit messages, stage explicit pathspecs,
 
 That runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Run it after the last edit, not before one: a check that ran before a later change proves nothing about the change.
 
+A change to Chan's keyboard relay in `assets/app.js` also runs its focused test, which executes the relay block as shipped against keydowns from published keyboard layouts:
+
+```sh
+node --test scripts/tests/keyboard-relay.test.mjs
+```
+
 ## WhatsApp bridge
 
 The bridge is exercisable without a WhatsApp account. Everything except the live socket runs against seams:
