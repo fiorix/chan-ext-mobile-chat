@@ -59,7 +59,7 @@ jobs:
             package_target: windows-x86_64
             binary: target/x86_64-pc-windows-msvc/release/mobile-chat-extension.exe
             archive: mobile-chat-windows-x86_64.zip
-          - runner: macos-14
+          - runner: macos-15
             rust_target: aarch64-apple-darwin
             package_target: macos-aarch64
             binary: target/aarch64-apple-darwin/release/mobile-chat-extension
